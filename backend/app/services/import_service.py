@@ -172,6 +172,7 @@ async def _save_raw_input(
         raw = OrderRawInput(
             source_type=job.source_type,
             source_ref=f"{job.source_ref}#row{row_number}",
+            source_row_index=row_number,   # 마이그레이션 기준: source_row_index
             import_job_id=job.id,
             raw_data=row_data,
         )

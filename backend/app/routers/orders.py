@@ -1,21 +1,28 @@
 """
 Order 라우터
-GET    /api/v1/orders                    — 목록
-POST   /api/v1/orders/from-raw           — raw input → Order + OrderItem 표준화 (핵심)
-POST   /api/v1/orders                    — 수동 생성 (보조, Wave 1 최소 구현)
-GET    /api/v1/orders/{id}               — 상세
-PATCH  /api/v1/orders/{id}               — 수정
-DELETE /api/v1/orders/{id}               — 소프트 삭제 (ADMIN)
 
-GET    /api/v1/orders/raw-inputs          — 원본 입력 목록
-GET    /api/v1/orders/raw-inputs/{id}     — 원본 입력 상세
+엔드포인트:
+  GET    /api/v1/orders                  — 주문 목록 (필터: agency_id, source_type, status)
+  POST   /api/v1/orders/from-raw         — raw input → Order + OrderItem 표준화 (핵심 경로)
+  POST   /api/v1/orders                  — 직접 주문 생성 (web_portal 주 경로 / manual_input)
+  GET    /api/v1/orders/{id}             — 주문 상세
+  PATCH  /api/v1/orders/{id}             — 주문 수정
+  DELETE /api/v1/orders/{id}             — 소프트 삭제 (ADMIN)
+  GET    /api/v1/orders/raw-inputs       — raw input 목록
+  GET    /api/v1/orders/raw-inputs/{id}  — raw input 상세
+
+source_type 정책:
+  - web_portal        : 주 경로 — 플랫폼 UI 직접 생성
+  - google_sheet_import: 보조 경로 — 시트 URL → raw → from-raw 표준화
+  - excel_import      : 보조 경로 Wave 2
+  - manual_input      : 개발/디버그 직접 API 호출
 """
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,46 +30,65 @@ from app.core.database import get_db
 from app.core.dependencies import get_current_user, require_operator, require_admin
 from app.core.response import ok, paginated
 from app.core.exceptions import NotFoundError
-from app.models.order import Order, OrderRawInput, OrderItem, OrderItemStatusHistory
+from app.models.order import (
+    Order, OrderRawInput, OrderItem, OrderItemStatusHistory,
+    ORDER_SOURCE_TYPES,
+)
 from app.models.user import User
 
 router = APIRouter()
 
 
-# ── 스키마 ───────────────────────────────────────────────────────
+# ── 인라인 스키마 ────────────────────────────────────────────────
 
 class OrderFromRaw(BaseModel):
     """
-    raw input → Order + OrderItem 표준화
-    Wave 1: 1 raw_input_id → 1 OrderItem (1:1 고정)
+    raw input → Order + OrderItem 표준화 (보조 intake 경로).
+    Google Sheet / Excel import 후 운영자가 수동 트리거.
+    1 raw_input_id → standardize_service가 1~N OrderItem 생성.
     """
     raw_input_id: uuid.UUID
-    # 표준화 힌트 — 없으면 raw_data에서 파싱 시도
+    # 힌트 — 없으면 raw_data 파싱으로 결정
     agency_name_snapshot: Optional[str] = None
-    brand_name_snapshot: Optional[str] = None
-    note: Optional[str] = None
+    operator_note: Optional[str] = None
 
 
 class OrderCreate(BaseModel):
-    """수동 생성 (보조 경로, Wave 1 최소)"""
+    """
+    직접 주문 생성.
+    주 경로(web_portal): 플랫폼 UI에서 전체 정보 입력.
+    source_type 기본값 = web_portal.
+    """
     agency_id: Optional[uuid.UUID] = None
     agency_name_snapshot: Optional[str] = None
-    brand_id: Optional[uuid.UUID] = None
-    brand_name_snapshot: Optional[str] = None
-    source_type: str = "manual_input"
-    note: Optional[str] = None
+    sales_rep_name: Optional[str] = None
+    estimator_name: Optional[str] = None
+    source_type: str = Field(
+        default="web_portal",
+        description="web_portal | google_sheet_import | excel_import | manual_input",
+    )
+    operator_note: Optional[str] = None
+
+
+class OrderUpdate(BaseModel):
+    agency_id: Optional[uuid.UUID] = None
+    agency_name_snapshot: Optional[str] = None
+    sales_rep_name: Optional[str] = None
+    estimator_name: Optional[str] = None
+    status: Optional[str] = None
+    operator_note: Optional[str] = None
 
 
 class OrderOut(BaseModel):
     id: str
     raw_input_id: Optional[str]
-    order_number: Optional[str]
     agency_id: Optional[str]
     agency_name_snapshot: Optional[str]
-    brand_id: Optional[str]
-    brand_name_snapshot: Optional[str]
-    source_type: str
-    note: Optional[str]
+    sales_rep_name: Optional[str]
+    estimator_name: Optional[str]
+    source_type: Optional[str]
+    status: str
+    operator_note: Optional[str]
     is_deleted: bool
     created_at: datetime
     updated_at: datetime
@@ -73,13 +99,13 @@ class OrderOut(BaseModel):
         return cls(
             id=str(o.id),
             raw_input_id=str(o.raw_input_id) if o.raw_input_id else None,
-            order_number=o.order_number,
             agency_id=str(o.agency_id) if o.agency_id else None,
             agency_name_snapshot=o.agency_name_snapshot,
-            brand_id=str(o.brand_id) if o.brand_id else None,
-            brand_name_snapshot=o.brand_name_snapshot,
+            sales_rep_name=o.sales_rep_name,
+            estimator_name=o.estimator_name,
             source_type=o.source_type,
-            note=o.note,
+            status=o.status,
+            operator_note=o.operator_note,
             is_deleted=o.is_deleted,
             created_at=o.created_at,
             updated_at=o.updated_at,
@@ -107,7 +133,8 @@ async def list_orders(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     agency_id: Optional[uuid.UUID] = Query(None),
-    source_type: Optional[str] = Query(None),
+    source_type: Optional[str] = Query(None, description=", ".join(ORDER_SOURCE_TYPES)),
+    order_status: Optional[str] = Query(None, alias="status"),
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
@@ -116,6 +143,8 @@ async def list_orders(
         q = q.where(Order.agency_id == agency_id)
     if source_type:
         q = q.where(Order.source_type == source_type)
+    if order_status:
+        q = q.where(Order.status == order_status)
 
     total = (
         await db.execute(select(func.count()).select_from(q.subquery()))
@@ -136,7 +165,7 @@ async def list_orders(
 @router.post(
     "/from-raw",
     status_code=status.HTTP_201_CREATED,
-    summary="raw input → Order + OrderItem 표준화 (핵심 경로)",
+    summary="raw input → Order + OrderItem 표준화 (보조 intake 경로)",
 )
 async def create_order_from_raw(
     body: OrderFromRaw,
@@ -144,11 +173,11 @@ async def create_order_from_raw(
     current_user: User = Depends(require_operator),
 ):
     """
-    Wave 1 핵심 엔드포인트.
-    1 raw_input (1 row) → 1 Order + 1 OrderItem (1:1 고정).
-    raw_data에서 place_url, keywords, product_type 등을 파싱하여 OrderItem 생성.
+    Google Sheet / Excel import 후 보조 intake 경로.
+    standardize_service를 통해 1 raw row → 1~N OrderItem 변환.
     """
-    # 1. raw input 조회
+    from app.services.standardize_service import standardize_raw_input
+
     raw = (
         await db.execute(
             select(OrderRawInput).where(OrderRawInput.id == body.raw_input_id)
@@ -163,87 +192,45 @@ async def create_order_from_raw(
             detail=f"이미 처리된 raw input입니다. result_order_id: {raw.result_order_id}",
         )
 
-    # 2. raw_data에서 기본 정보 파싱 (Wave 1: 유연한 파싱)
-    raw_data: dict = raw.raw_data or {}
+    # 힌트 override
+    if body.agency_name_snapshot:
+        raw.raw_data = {**raw.raw_data, "대행사명": body.agency_name_snapshot}
 
-    agency_name = body.agency_name_snapshot or raw_data.get("대행사명") or raw_data.get("agency_name")
-    brand_name = body.brand_name_snapshot or raw_data.get("브랜드") or raw_data.get("brand_name")
-    place_url = raw_data.get("모바일플레이스URL") or raw_data.get("naver_place_url") or raw_data.get("place_url")
-    place_name = raw_data.get("업체명") or raw_data.get("place_name")
-    product_name = raw_data.get("상품명") or raw_data.get("product_name")
-    keywords_raw = raw_data.get("키워드") or raw_data.get("keywords") or []
-
-    # 키워드 처리 (문자열이면 쉼표 분리)
-    if isinstance(keywords_raw, str):
-        keywords = [k.strip() for k in keywords_raw.split(",") if k.strip()]
-    elif isinstance(keywords_raw, list):
-        keywords = keywords_raw
-    else:
-        keywords = []
-
-    # 3. Order 생성
-    order = Order(
-        raw_input_id=raw.id,
-        agency_name_snapshot=agency_name,
-        brand_name_snapshot=brand_name,
-        source_type=raw.source_type,
-        note=body.note,
-    )
-    db.add(order)
-    await db.flush()  # order.id 확보
-
-    # 4. OrderItem 생성 (Wave 1: 1:1 고정)
-    item = OrderItem(
-        order_id=order.id,
-        place_name_snapshot=place_name,
-        naver_place_url_snapshot=place_url,
-        product_type_code_snapshot=product_name,
-        keywords=keywords if keywords else None,
-        spec_data=raw_data,  # raw_data 전체를 spec_data에 보관
-        status="received",
-    )
-    db.add(item)
-    await db.flush()  # item.id 확보
-
-    # 5. 상태 이력 초기 기록
-    history = OrderItemStatusHistory(
-        order_item_id=item.id,
-        from_status=None,
-        to_status="received",
-        actor_id=current_user.id,
-        note="from-raw 표준화 생성",
-    )
-    db.add(history)
-
-    # 6. raw input 처리 완료 표시 (loose reference)
-    # NOTE: raw input은 불변이므로 is_processed만 업데이트
-    raw.is_processed = True
-    raw.result_order_id = order.id  # loose reference
-
-    await db.commit()
-    await db.refresh(order)
+    result = await standardize_raw_input(db=db, raw=raw, actor=current_user)
 
     return ok({
-        "order": OrderOut.from_orm(order, item_count=1).model_dump(),
-        "order_item_id": str(item.id),
-        "status": item.status,
+        "order": OrderOut.from_orm(
+            result.order,
+            item_count=len(result.items) + len(result.held_items),
+        ).model_dump(),
+        "items_created": len(result.items),
+        "items_on_hold": len(result.held_items),
+        "item_ids": [str(i.id) for i in result.items + result.held_items],
     })
 
 
-@router.post("", status_code=status.HTTP_201_CREATED, summary="주문 수동 생성 (보조 경로)")
+@router.post("", status_code=status.HTTP_201_CREATED, summary="직접 주문 생성 (web_portal 주 경로)")
 async def create_order(
     body: OrderCreate,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_operator),
 ):
-    """Wave 1 최소 구현. 메인 흐름은 /from-raw 사용."""
+    """
+    플랫폼 UI 직접 입력 (source_type=web_portal) 또는 수동 입력.
+    Wave 1: Order 헤더만 생성. OrderItem은 별도 POST /order-items로 추가.
+    """
+    if body.source_type not in ORDER_SOURCE_TYPES:
+        raise HTTPException(
+            400,
+            f"유효하지 않은 source_type: {body.source_type}. 허용: {ORDER_SOURCE_TYPES}",
+        )
     order = Order(
         agency_id=body.agency_id,
         agency_name_snapshot=body.agency_name_snapshot,
-        brand_id=body.brand_id,
-        brand_name_snapshot=body.brand_name_snapshot,
+        sales_rep_name=body.sales_rep_name,
+        estimator_name=body.estimator_name,
         source_type=body.source_type,
-        note=body.note,
+        operator_note=body.operator_note,
     )
     db.add(order)
     await db.commit()
@@ -251,7 +238,7 @@ async def create_order(
     return ok(OrderOut.from_orm(order).model_dump())
 
 
-@router.get("/raw-inputs", summary="원본 입력 목록 (ORDER_RAW)")
+@router.get("/raw-inputs", summary="원본 입력 목록")
 async def list_raw_inputs(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
@@ -281,6 +268,8 @@ async def list_raw_inputs(
             "id": str(r.id),
             "source_type": r.source_type,
             "source_ref": r.source_ref,
+            "source_sheet_name": r.source_sheet_name,
+            "source_row_index": r.source_row_index,
             "import_job_id": str(r.import_job_id) if r.import_job_id else None,
             "result_order_id": str(r.result_order_id) if r.result_order_id else None,
             "is_processed": r.is_processed,
@@ -306,6 +295,8 @@ async def get_raw_input(
         "id": str(raw.id),
         "source_type": raw.source_type,
         "source_ref": raw.source_ref,
+        "source_sheet_name": raw.source_sheet_name,
+        "source_row_index": raw.source_row_index,
         "import_job_id": str(raw.import_job_id) if raw.import_job_id else None,
         "result_order_id": str(raw.result_order_id) if raw.result_order_id else None,
         "raw_data": raw.raw_data,
@@ -336,7 +327,7 @@ async def get_order(
 @router.patch("/{order_id}", summary="주문 수정")
 async def update_order(
     order_id: uuid.UUID,
-    body: OrderCreate,
+    body: OrderUpdate,
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_operator),
 ):
@@ -356,7 +347,6 @@ async def delete_order(
 ):
     order = await _get_order_or_404(order_id, db)
 
-    # OrderItem이 있으면 삭제 불가 (RESTRICT)
     item_count = (
         await db.execute(
             select(func.count()).where(

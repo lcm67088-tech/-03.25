@@ -37,6 +37,7 @@ from app.routers.providers import (
     agency_router,
     brand_router,
 )
+from app.routers.order_items import router as order_items_router
 from app.routers.audit import router as audit_router
 
 settings = get_settings()
@@ -71,20 +72,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── 라우터 등록 ────────────────────────────────────────────
-app.include_router(auth_router, prefix=API_PREFIX)
-app.include_router(users_router, prefix=f"{API_PREFIX}/users")
-app.include_router(places_router, prefix=API_PREFIX)
-app.include_router(import_jobs_router, prefix=API_PREFIX)
-app.include_router(orders_router, prefix=API_PREFIX)
-app.include_router(provider_router, prefix=API_PREFIX)
-app.include_router(spt_router, prefix=API_PREFIX)
-app.include_router(sellable_router, prefix=API_PREFIX)
-app.include_router(po_router, prefix=API_PREFIX)
-app.include_router(mapping_router, prefix=API_PREFIX)
-app.include_router(agency_router, prefix=API_PREFIX)
-app.include_router(brand_router, prefix=API_PREFIX)
-app.include_router(audit_router, prefix=API_PREFIX)
+# ── 라우터 등록 ─────────────────────────────────────────────
+# 인증
+app.include_router(auth_router,         prefix=API_PREFIX,              tags=["auth"])
+# 사용자
+app.include_router(users_router,        prefix=f"{API_PREFIX}/users",   tags=["users"])
+# Place
+app.include_router(places_router,       prefix=f"{API_PREFIX}/places",  tags=["places"])
+# Import jobs
+app.include_router(import_jobs_router,  prefix=f"{API_PREFIX}/import-jobs", tags=["import-jobs"])
+# Order 도메인
+app.include_router(orders_router,       prefix=f"{API_PREFIX}/orders",  tags=["orders"])
+app.include_router(order_items_router,  prefix=f"{API_PREFIX}/order-items", tags=["order-items"])
+# Provider / Offering
+app.include_router(provider_router,     prefix=API_PREFIX,              tags=["providers"])
+app.include_router(spt_router,          prefix=API_PREFIX,              tags=["standard-product-types"])
+app.include_router(sellable_router,     prefix=API_PREFIX,              tags=["sellable-offerings"])
+app.include_router(po_router,           prefix=API_PREFIX,              tags=["provider-offerings"])
+app.include_router(mapping_router,      prefix=API_PREFIX,              tags=["mappings"])
+# Agency / Brand
+app.include_router(agency_router,       prefix=API_PREFIX,              tags=["agencies"])
+app.include_router(brand_router,        prefix=API_PREFIX,              tags=["brands"])
+# Infra
+app.include_router(audit_router,        prefix=API_PREFIX,              tags=["audit"])
 
 
 @app.get("/health", tags=["health"])

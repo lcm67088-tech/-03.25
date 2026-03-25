@@ -1,24 +1,28 @@
 """
 OrderItem 라우터
-GET    /api/v1/order-items                    — 목록 (필터: order_id, status, place_id)
-GET    /api/v1/order-items/{id}               — 상세
-PATCH  /api/v1/order-items/{id}               — 필드 수정
-POST   /api/v1/order-items/{id}/status        — 상태 전이 (핵심)
-POST   /api/v1/order-items/{id}/assign        — 실행처 배정 (수동 라우팅)
-GET    /api/v1/order-items/{id}/history       — 상태 이력
+
+엔드포인트:
+  GET    /api/v1/order-items                — 목록 (필터: order_id, status, place_id, provider_id)
+  GET    /api/v1/order-items/{id}           — 상세
+  PATCH  /api/v1/order-items/{id}           — 필드 수정
+  POST   /api/v1/order-items/{id}/status    — 상태 전이 (핵심)
+  POST   /api/v1/order-items/{id}/assign    — 실행처 배정 (수동 라우팅)
+  GET    /api/v1/order-items/{id}/history   — 상태 이력
 
 Wave 1 상태 전이 매트릭스:
-  received    → reviewing | on_hold | cancelled
-  reviewing   → ready_to_route | on_hold | cancelled
-  on_hold     → reviewing | cancelled
-  ready_to_route → assigned | cancelled
-  assigned    → in_progress | cancelled
-  in_progress → done | on_hold
-  done        → confirmed
-  confirmed   → settlement_ready
-  settlement_ready → closed
-  cancelled   → (종료)
-  closed      → (종료)
+  received        → reviewing | on_hold | cancelled
+  reviewing       → ready_to_route | on_hold | cancelled
+  on_hold         → reviewing | cancelled
+  ready_to_route  → assigned | on_hold | cancelled
+  assigned        → in_progress | ready_to_route | cancelled
+  in_progress     → done | assigned | cancelled
+  done            → confirmed | in_progress
+  confirmed       → settlement_ready
+  settlement_ready→ closed
+  cancelled       → (종료)
+  closed          → (종료)
+
+컬럼명 기준: 마이그레이션 001_initial_schema.py
 """
 import uuid
 from datetime import date, datetime, timezone
@@ -33,65 +37,55 @@ from app.core.database import get_db
 from app.core.dependencies import get_current_user, require_operator, require_admin
 from app.core.response import ok, paginated
 from app.core.exceptions import NotFoundError
-from app.models.order import OrderItem, OrderItemStatusHistory
+from app.models.order import OrderItem, OrderItemStatusHistory, ORDER_ITEM_TRANSITIONS
 from app.models.user import User
 
 router = APIRouter()
 
-# 상태 전이 허용 매트릭스
-ALLOWED_TRANSITIONS: dict[str, list[str]] = {
-    "received":        ["reviewing", "on_hold", "cancelled"],
-    "reviewing":       ["ready_to_route", "on_hold", "cancelled"],
-    "on_hold":         ["reviewing", "cancelled"],
-    "ready_to_route":  ["assigned", "cancelled"],
-    "assigned":        ["in_progress", "cancelled"],
-    "in_progress":     ["done", "on_hold"],
-    "done":            ["confirmed"],
-    "confirmed":       ["settlement_ready"],
-    "settlement_ready":["closed"],
-    "cancelled":       [],
-    "closed":          [],
-}
+# 상태 전이 허용 매트릭스 (models.order.ORDER_ITEM_TRANSITIONS 미러)
+ALLOWED_TRANSITIONS: dict[str, list[str]] = ORDER_ITEM_TRANSITIONS
 
-# ADMIN만 허용되는 전이 (역방향 또는 고급)
+# ADMIN만 허용되는 전이 (정산 완료 단계)
 ADMIN_ONLY_TRANSITIONS: set[tuple[str, str]] = {
-    ("done", "confirmed"),
     ("confirmed", "settlement_ready"),
     ("settlement_ready", "closed"),
 }
 
 
-# ── 스키마 ───────────────────────────────────────────────────────
+# ── 인라인 스키마 ───────────────────────────────────────────────
 
 class OrderItemUpdate(BaseModel):
+    """운영자 수정 가능 필드 (마이그레이션 컬럼명 기준)"""
     place_id: Optional[uuid.UUID] = None
     place_name_snapshot: Optional[str] = None
-    naver_place_url_snapshot: Optional[str] = None
+    place_url_snapshot: Optional[str] = None           # 구 naver_place_url_snapshot
+    naver_place_id_snapshot: Optional[str] = None
     sellable_offering_id: Optional[uuid.UUID] = None
-    product_type_code_snapshot: Optional[str] = None
+    standard_product_type_id: Optional[uuid.UUID] = None
+    product_type_code: Optional[str] = None            # 구 product_type_code_snapshot
     product_subtype: Optional[str] = None
-    keywords: Optional[list[str]] = None
+    main_keyword: Optional[str] = None                 # 구 keyword_snapshot
+    keywords_raw: Optional[str] = None                 # 쉼표 구분 키워드 원문 (구 keywords ARRAY)
     spec_data: Optional[dict] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     daily_qty: Optional[int] = None
-    quantity: Optional[int] = None
-    unit_price: Optional[int] = None
-    total_amount: Optional[int] = None
+    total_qty: Optional[int] = None
+    working_days: Optional[int] = None
+    unit_price: Optional[int] = None                   # 구 unit_price_snapshot
+    total_amount: Optional[int] = None                 # 구 total_amount_snapshot
     operator_note: Optional[str] = None
-    proof_url: Optional[str] = None
 
 
 class StatusTransitionRequest(BaseModel):
     to_status: str
-    note: Optional[str] = None
+    reason: Optional[str] = None                       # 구 note → reason (모델 기준)
 
 
 class AssignProviderRequest(BaseModel):
     provider_id: uuid.UUID
     provider_offering_id: Optional[uuid.UUID] = None
-    provider_name_snapshot: Optional[str] = None
-    note: Optional[str] = None
+    reason: Optional[str] = None
 
 
 class OrderItemOut(BaseModel):
@@ -99,23 +93,27 @@ class OrderItemOut(BaseModel):
     order_id: str
     place_id: Optional[str]
     place_name_snapshot: Optional[str]
-    naver_place_url_snapshot: Optional[str]
+    place_url_snapshot: Optional[str]
+    naver_place_id_snapshot: Optional[str]
+    standard_product_type_id: Optional[str]
     sellable_offering_id: Optional[str]
-    product_type_code_snapshot: Optional[str]
+    product_type_code: Optional[str]
     product_subtype: Optional[str]
-    assigned_provider_id: Optional[str]
-    provider_name_snapshot: Optional[str]
-    keywords: Optional[list]
+    provider_id: Optional[str]                         # 구 assigned_provider_id
+    provider_offering_id: Optional[str]
+    main_keyword: Optional[str]
+    keywords_raw: Optional[str]
     spec_data: Optional[dict]
     start_date: Optional[date]
     end_date: Optional[date]
     daily_qty: Optional[int]
-    quantity: Optional[int]
+    total_qty: Optional[int]
+    working_days: Optional[int]
     unit_price: Optional[int]
     total_amount: Optional[int]
     status: str
+    routed_at: Optional[datetime]
     operator_note: Optional[str]
-    proof_url: Optional[str]
     is_deleted: bool
     created_at: datetime
     updated_at: datetime
@@ -127,23 +125,33 @@ class OrderItemOut(BaseModel):
             order_id=str(item.order_id),
             place_id=str(item.place_id) if item.place_id else None,
             place_name_snapshot=item.place_name_snapshot,
-            naver_place_url_snapshot=item.naver_place_url_snapshot,
-            sellable_offering_id=str(item.sellable_offering_id) if item.sellable_offering_id else None,
-            product_type_code_snapshot=item.product_type_code_snapshot,
+            place_url_snapshot=item.place_url_snapshot,
+            naver_place_id_snapshot=item.naver_place_id_snapshot,
+            standard_product_type_id=(
+                str(item.standard_product_type_id) if item.standard_product_type_id else None
+            ),
+            sellable_offering_id=(
+                str(item.sellable_offering_id) if item.sellable_offering_id else None
+            ),
+            product_type_code=item.product_type_code,
             product_subtype=item.product_subtype,
-            assigned_provider_id=str(item.assigned_provider_id) if item.assigned_provider_id else None,
-            provider_name_snapshot=item.provider_name_snapshot,
-            keywords=item.keywords,
+            provider_id=str(item.provider_id) if item.provider_id else None,
+            provider_offering_id=(
+                str(item.provider_offering_id) if item.provider_offering_id else None
+            ),
+            main_keyword=item.main_keyword,
+            keywords_raw=item.keywords_raw,
             spec_data=item.spec_data,
             start_date=item.start_date,
             end_date=item.end_date,
             daily_qty=item.daily_qty,
-            quantity=item.quantity,
+            total_qty=item.total_qty,
+            working_days=item.working_days,
             unit_price=item.unit_price,
             total_amount=item.total_amount,
             status=item.status,
+            routed_at=item.routed_at,
             operator_note=item.operator_note,
-            proof_url=item.proof_url,
             is_deleted=item.is_deleted,
             created_at=item.created_at,
             updated_at=item.updated_at,
@@ -171,17 +179,16 @@ async def _add_status_history(
     item_id: uuid.UUID,
     from_status: Optional[str],
     to_status: str,
-    actor_id: Optional[uuid.UUID],
-    note: Optional[str] = None,
-    extra_data: Optional[dict] = None,
+    changed_by: Optional[uuid.UUID],
+    reason: Optional[str] = None,
 ) -> None:
+    """상태 이력 INSERT-only 기록 (changed_by = 마이그레이션 컬럼명)."""
     history = OrderItemStatusHistory(
         order_item_id=item_id,
         from_status=from_status,
         to_status=to_status,
-        actor_id=actor_id,
-        note=note,
-        extra_data=extra_data,
+        changed_by=changed_by,
+        reason=reason,
     )
     db.add(history)
 
@@ -207,7 +214,7 @@ async def list_order_items(
     if place_id:
         q = q.where(OrderItem.place_id == place_id)
     if provider_id:
-        q = q.where(OrderItem.assigned_provider_id == provider_id)
+        q = q.where(OrderItem.provider_id == provider_id)
 
     total = (
         await db.execute(select(func.count()).select_from(q.subquery()))
@@ -264,22 +271,19 @@ async def transition_status(
 ):
     """
     Wave 1 상태 전이.
-    일부 전이는 ADMIN만 가능 (ADMIN_ONLY_TRANSITIONS).
+    ADMIN_ONLY_TRANSITIONS에 해당하는 전이는 ADMIN만 가능.
     """
     item = await _get_item_or_404(item_id, db)
     from_status = item.status
     to_status = body.to_status
 
-    # 허용 전이 검증
     allowed = ALLOWED_TRANSITIONS.get(from_status, [])
     if to_status not in allowed:
         raise HTTPException(
             400,
-            f"허용되지 않는 상태 전이입니다: {from_status} → {to_status}. "
-            f"허용: {allowed}",
+            f"허용되지 않는 상태 전이입니다: {from_status} → {to_status}. 허용: {allowed}",
         )
 
-    # ADMIN 전용 전이 검증
     if (from_status, to_status) in ADMIN_ONLY_TRANSITIONS:
         if not current_user.is_admin:
             raise HTTPException(
@@ -289,7 +293,9 @@ async def transition_status(
 
     item.status = to_status
     await _add_status_history(
-        db, item.id, from_status, to_status, current_user.id, note=body.note
+        db, item.id, from_status, to_status,
+        changed_by=current_user.id,
+        reason=body.reason,
     )
     await db.commit()
     await db.refresh(item)
@@ -305,7 +311,8 @@ async def assign_provider(
 ):
     """
     Wave 1: 수동 라우팅.
-    배정 후 상태를 ready_to_route → assigned로 자동 전이.
+    ready_to_route 또는 reviewing 상태에서 provider 배정.
+    배정 후 상태를 자동으로 assigned로 전이.
     """
     item = await _get_item_or_404(item_id, db)
 
@@ -316,19 +323,18 @@ async def assign_provider(
         )
 
     old_status = item.status
-    item.assigned_provider_id = body.provider_id
-    item.assigned_provider_offering_id = body.provider_offering_id
-    if body.provider_name_snapshot:
-        item.provider_name_snapshot = body.provider_name_snapshot
+    item.provider_id = body.provider_id
+    item.provider_offering_id = body.provider_offering_id
+    item.routed_at = datetime.now(timezone.utc)
+    item.routed_by = current_user.id
 
     # 상태 자동 전이
-    if old_status != "assigned":
-        item.status = "assigned"
-        await _add_status_history(
-            db, item.id, old_status, "assigned", current_user.id,
-            note=body.note or "실행처 수동 배정",
-            extra_data={"provider_id": str(body.provider_id)},
-        )
+    item.status = "assigned"
+    await _add_status_history(
+        db, item.id, old_status, "assigned",
+        changed_by=current_user.id,
+        reason=body.reason or "실행처 수동 배정",
+    )
 
     await db.commit()
     await db.refresh(item)
@@ -354,9 +360,8 @@ async def get_status_history(
             "id": str(h.id),
             "from_status": h.from_status,
             "to_status": h.to_status,
-            "actor_id": str(h.actor_id) if h.actor_id else None,
-            "note": h.note,
-            "extra_data": h.extra_data,
+            "changed_by": str(h.changed_by) if h.changed_by else None,
+            "reason": h.reason,
             "created_at": h.created_at.isoformat(),
         }
         for h in histories
