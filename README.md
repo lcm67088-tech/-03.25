@@ -1,151 +1,176 @@
-# PlaceOpt — 내부 운영 시스템 (Internal MVP)
+# PlaceOpt Internal Console — Wave 1
 
 ## 프로젝트 개요
 
-PlaceOpt는 네이버 플레이스 마케팅 운영팀을 위한 **내부 OS형 운영 도구**입니다.  
-외부 고객용 SaaS가 아닌, 운영자가 직접 사용하는 내부 콘솔입니다.
+**PlaceOpt**는 네이버 플레이스 마케팅 운영팀을 위한 **내부 운영 콘솔 (OS형 MVP)**입니다.  
+외부 고객 포털이 아닌, 운영자가 직접 사용하는 내부 도구입니다.
 
-**핵심 흐름**: Place 수집·파싱 → 검수 → 주문 접수 → 표준화 → 매핑·라우팅 → 템플릿 생성·전달 → OrderItem 상태 추적 → 정산
-
----
-
-## Wave 1 완료 기능
-
-### ✅ 인증 / 권한
-- JWT 기반 로그인 (`POST /api/v1/auth/login`)
-- 역할 체계: `ADMIN` | `OPERATOR` (Wave 1 확정. VIEWER 후속 추가 예정)
-- 사용자 관리 CRUD (ADMIN 전용)
-
-### ✅ Place 도메인
-- Place CRUD (`/api/v1/places`)
-- PlaceRawSnapshot INSERT 전용 저장 (`/api/v1/places/snapshots`)
-- 검수 액션 (confirm / reject / note_added / field_edited)
-- 검수 이력 조회
-
-### ✅ Import 작업
-- Google Sheet URL 기반 Import 작업 생성 (`POST /api/v1/import-jobs`) — **주 흐름**
-- Excel 파일 업로드 보조 경로 (`POST /api/v1/import-jobs/upload`)
-- Import Job 재시도 (`POST /api/v1/import-jobs/{id}/retry`)
-- Raw Input 목록 조회
-
-### ✅ Order / OrderItem
-- `POST /api/v1/orders/from-raw`: raw_input → Order + OrderItem 1:1 표준화
-- Order CRUD
-- OrderItem 상태 전이 (`POST /api/v1/orders/{id}/items/{item_id}/status`)
-- 상태 이력 조회
-- 수동 실행처 배정 (`POST /api/v1/orders/{id}/items/{item_id}/assign-provider`)
-
-### ✅ Provider / Product 구조
-- Provider, StandardProductType, SellableOffering, ProviderOffering, Mapping CRUD
-- Agency / Brand 테이블 (Wave 2 강제 예정, Wave 1은 nullable)
-
-### ✅ 인프라
-- Audit Log 조회
-- Dashboard 요약 (`GET /api/v1/dashboard/summary`)
-- Alembic 마이그레이션 (`001_initial_schema`)
-
----
-
-## API 엔드포인트 목록
-
-Base URL: `http://localhost:8000/api/v1`
-
-| Method | Path | 설명 | 권한 |
-|--------|------|------|------|
-| POST | /auth/login | 로그인 | - |
-| GET | /auth/me | 현재 사용자 | ANY |
-| CRUD | /users | 사용자 관리 | ADMIN |
-| GET/POST | /places | Place 목록/생성 | ANY/OP |
-| PATCH/DELETE | /places/{id} | Place 수정/삭제 | OP |
-| POST | /places/snapshots | 스냅샷 저장 | OP |
-| POST | /places/{id}/review | 검수 액션 | OP |
-| POST | /import-jobs | GSheet import 요청 | OP |
-| POST | /import-jobs/upload | Excel 업로드 | OP |
-| POST | /import-jobs/{id}/retry | 재시도 | OP |
-| POST | /orders/from-raw | raw→OrderItem 표준화 | OP |
-| GET/POST | /orders | 주문 목록/생성 | ANY/OP |
-| PATCH/DELETE | /orders/{id} | 주문 수정/삭제 | OP |
-| GET/PATCH | /orders/{id}/items/{item_id} | OrderItem 조회/수정 | ANY/OP |
-| POST | /orders/{id}/items/{item_id}/status | 상태 전이 | OP |
-| POST | /orders/{id}/items/{item_id}/assign-provider | 실행처 배정 | OP |
-| CRUD | /providers | 실행처 관리 | ANY/OP |
-| GET/POST | /standard-product-types | 표준 상품 유형 | ANY/ADMIN |
-| CRUD | /sellable-offerings | 판매 상품 | ANY/OP |
-| CRUD | /provider-offerings | 실행처 상품 | ANY/OP |
-| CRUD | /mappings | SellableProvider 매핑 | ANY/OP |
-| CRUD | /agencies, /brands | 대행사/브랜드 | ANY/OP |
-| GET | /audit-logs | 감사 로그 | ANY |
-| GET | /dashboard/summary | 운영 요약 | ANY |
-
----
-
-## OrderItem 상태 흐름
-
+### 핵심 운영 플로우
 ```
-received → on_hold ↔ reviewing → ready_to_route → assigned → in_progress → done → confirmed → settlement_ready → closed
-                                                                                    ↑ (can also go back to in_progress)
-cancelled (모든 단계에서 가능, closed 제외)
+Place 수집/파싱 → 검수/보정 → 주문 입력 → 표준화
+→ 실행 매핑 → 라우팅 → 템플릿 생성/전달
+→ OrderItem 상태 추적 → 고객/실행처 정산 분리
 ```
 
 ---
 
-## StandardProductType 목록 (초안/제안안)
+## 현재 구현 범위 (Wave 1)
 
-| 코드 | 표시명 | 시트 |
+### ✅ 완료된 기능
+1. **인증**: JWT 기반 로그인/로그아웃, 역할 기반 접근 (ADMIN / OPERATOR)
+2. **Place 원본 스냅샷 저장**: Google Sheet / Excel 임포트 → `place_raw_snapshots` (불변)
+3. **Place 검수 흐름**: 검수 상태 전이 (pending_review → confirmed/rejected), 검수 이력 기록
+4. **주문 임포트**: Google Sheet URL → `order_raw_inputs` (불변 원본 저장)
+5. **Order/OrderItem 표준화**: 1 row → N items 변환, 매핑 실패 시 `on_hold` 보존
+6. **OrderItem 상태 추적**: 11개 상태 + 허용 전이 규칙 + 이력 기록
+7. **수동 라우팅**: 실행처 배정 (`ready_to_route` → `assigned`)
+8. **Offering 관리**: StandardProductType / SellableOffering / ProviderOffering / 매핑
+9. **ImportJob 추적**: Google Sheet/Excel 임포트 작업 상태 관리 + 재시도
+10. **AuditLog**: 전 도메인 액션 불변 기록
+11. **대시보드**: 기본 집계 (Place/Order/OrderItem/ImportJob 상태별 카운트)
+
+### ❌ Wave 1 미포함 (Wave 2+)
+- 고객/실행처 정산 분리 (CustomerSettlement / ProviderSettlement)
+- 자동 라우팅 엔진
+- FormTemplate 생성/전달
+- 전체 Google Sheet API (현재: CSV export 방식)
+- 상세 RBAC (VIEWER 역할 등)
+
+---
+
+## API 엔드포인트 요약
+
+Base: `http://localhost:8000/api/v1`  
+Docs: `http://localhost:8000/docs` (DEBUG 모드)
+
+| 그룹 | 경로 | 설명 |
+|------|------|------|
+| 인증 | `/auth/login`, `/auth/logout`, `/auth/me` | JWT 인증 |
+| 사용자 | `/users` | ADMIN 전용 사용자 관리 |
+| 플레이스 | `/places`, `/places/{id}/review`, `/places/{id}/snapshots` | Place 검수 흐름 |
+| 임포트 | `/import-jobs/google-sheet`, `/import-jobs/excel`, `/import-jobs/{id}/retry` | 시트/Excel 임포트 |
+| 주문 | `/orders`, `/orders/from-raw/{raw_id}` | Order 생성 및 raw 변환 |
+| 주문아이템 | `/order-items`, `/order-items/{id}/status`, `/order-items/{id}/route` | 상태 추적/라우팅 |
+| 실행처 | `/providers` | 매체사 등 실행처 관리 |
+| 상품 | `/offerings/product-types`, `/offerings/sellable`, `/offerings/provider`, `/offerings/mappings` | Offering 관리 |
+| 감사로그 | `/audit` | AuditLog 조회 |
+| 대시보드 | `/dashboard` | 운영 현황 집계 |
+
+---
+
+## 데이터 아키텍처
+
+### 핵심 테이블 (17개)
+```
+users                         — 운영자 계정 (ADMIN | OPERATOR)
+agencies / brands             — 대행사/브랜드 (Wave 1: nullable FK)
+places                        — 확정 플레이스 (소프트 삭제)
+place_raw_snapshots           — 원본 파싱 결과 (INSERT 전용, 불변)
+place_review_logs             — 검수 이력 (INSERT 전용, RESTRICT)
+providers                     — 실행처 (매체사 등)
+standard_product_types        — [초안] 표준 상품 유형 8개
+sellable_offerings            — 판매 상품 (판매 구조 축)
+provider_offerings            — 실행 상품 (실행 구조 축)
+sellable_provider_mappings    — 1:N 연결
+order_raw_inputs              — 원본 주문 행 (INSERT 전용, 불변)
+orders                        — 주문 헤더
+order_items                   — 주문 아이템 (상태 추적 단위)
+order_item_status_histories   — 상태 이력 (INSERT 전용, RESTRICT)
+import_jobs                   — 임포트 작업 추적
+audit_logs                    — 전 도메인 감사 로그 (INSERT 전용)
+```
+
+### 설계 원칙
+- **원본 불변**: `*_raw_*`, `*_logs`, `*_histories` 테이블은 INSERT 전용, CASCADE DELETE 금지
+- **소프트 삭제**: `places`, `orders`, `order_items`에 `is_deleted` 적용
+- **Loose Reference**: 일부 UUID 컬럼은 FK 없이 운영 (고아 레코드 허용, 문서화)
+- **자동 추정 금지**: 매핑 실패 시 null 유지 (운영자 수동 확인)
+- **판매/실행 분리**: SellableOffering ↔ ProviderOffering 구조적 분리
+
+### OrderItem 상태 전이
+```
+received → on_hold → reviewing → ready_to_route → assigned → in_progress → done → confirmed → settlement_ready → closed
+(모든 단계에서 → cancelled 가능)
+```
+
+---
+
+## StandardProductType 초안 (확정 아님)
+
+| 코드 | 표시명 | 채널 |
 |------|--------|------|
-| TRAFFIC | 리워드 트래픽 | 트래픽 취합 |
-| SAVE | 리워드 저장하기 | 저장 취합 |
-| AI_REAL | AI 실계정 프리미엄 배포 | AI(실계정) 취합 |
-| AI_NONREAL | AI 비실계 프리미엄 배포 | AI(비실계) 취합 |
-| BLOG_REPORTER | 실계정 기자단 | 기자단 취합 |
-| BLOG_DISPATCH | 블로그 배포(최블/엔비블) | 최블엔비블 취합 |
-| XIAOHONGSHU | 샤오홍슈 체험단 | 샤오홍슈 취합 |
-| DIANPING | 따종디엔핑 등록 | 따종디엔핑 취합 |
+| TRAFFIC | 트래픽 | naver_place |
+| SAVE | 저장 | naver_place |
+| AI_REAL | AI 실계정 | naver_place |
+| AI_NONREAL | AI 비실계 | naver_place |
+| BLOG_REPORTER | 기자단/실리뷰어 | blog |
+| BLOG_DISPATCH | 블로그배포(최블/엔비블) | blog |
+| XIAOHONGSHU | 샤오홍슈 | xiaohongshu |
+| DIANPING | 따종디엔핑 | dianping |
+
+---
+
+## 개발 환경 실행
+
+### 1. 사전 요구사항
+- Docker & Docker Compose
+- Python 3.12+
+
+### 2. 환경 설정
+```bash
+cd backend
+cp .env.example .env
+# .env 파일에서 SECRET_KEY 등 수정
+```
+
+### 3. Docker로 실행 (권장)
+```bash
+docker-compose up -d postgres redis
+cd backend
+pip install -r requirements.txt
+alembic upgrade head
+python seed.py  # 시드 데이터 (개발용)
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+### 4. 전체 Docker
+```bash
+docker-compose up -d
+```
+
+### 5. 기본 계정 (시드 데이터)
+- ADMIN: `admin@placeopt.internal` / `Admin1234!`
+- OPERATOR: `operator@placeopt.internal` / `Oper1234!`
 
 ---
 
 ## 기술 스택
-
 - **Backend**: FastAPI (Python 3.12) + SQLAlchemy 2.0 (async) + Alembic
-- **Database**: PostgreSQL 16 + Redis 7
-- **Auth**: JWT (python-jose) + bcrypt (passlib)
-- **Google Sheets**: gspread + google-auth
-- **Container**: Docker + Docker Compose
+- **DB**: PostgreSQL 16
+- **Cache**: Redis 7
+- **인증**: JWT (python-jose)
+- **Google Sheet**: httpx CSV export (Wave 1) → google-auth Service Account (Wave 2)
+- **Excel**: openpyxl
 
 ---
 
-## 로컬 실행
-
-```bash
-# 1. 환경변수 설정
-cp backend/.env.example backend/.env
-# .env 파일 편집
-
-# 2. Docker Compose로 실행
-docker-compose up -d
-
-# 3. 마이그레이션 실행
-docker-compose exec backend alembic upgrade head
-
-# 4. API 문서 확인
-open http://localhost:8000/docs
-```
+## 브랜치 전략
+- `main`: 안정 버전
+- `feat/wave1-foundation`: Wave 1 기반 (현재 작업)
+- PR 범위: 기능 단위 (wave 단위 PR 권장)
 
 ---
 
-## 미구현 (Wave 2+ 예정)
+## Wave 로드맵
 
-- 실제 Google Sheet API 연동 (현재 pending 상태 생성만)
-- FormTemplate 생성/전달
-- CustomerSettlement / ProviderSettlement (정산 분리)
-- 고급 라우팅 규칙 (RoutingRule 엔진)
-- 키워드 전략 모듈
-- 외부 고객 포털
+| Wave | 주요 기능 |
+|------|----------|
+| Wave 1 | 스켈레톤, 인증, DB 스키마, Place/Order raw 저장, 검수, 표준화, 라우팅(수동) |
+| Wave 2 | 정산(Customer/Provider), 자동 라우팅, 전체 Google Sheet API, VIEWER 역할 |
+| Wave 3 | FormTemplate, 대시보드 고도화, 배치 재시도, 예외 처리 강화 |
+| Wave 4+ | 자동화, 외부 포털, 분석 (MVP 이후) |
 
 ---
 
-## 저장소
-
-- **GitHub**: https://github.com/lcm67088-tech/-03.25
-- **Wave**: Wave 1 (skeleton + core domain + basic APIs)
-- **마지막 업데이트**: 2026-03-25
+**Last Updated**: 2026-03-25  
+**Status**: Wave 1 구현 완료 (GitHub 연동 대기)

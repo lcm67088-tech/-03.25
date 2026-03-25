@@ -2,7 +2,8 @@
 모든 모델 임포트 — Alembic autogenerate 감지용
 임포트 순서: 의존성 없는 것부터 (순환 임포트 방지)
 """
-# Base
+# Base (SQLAlchemy metadata root)
+from app.core.database import Base  # noqa: F401
 from app.models.base import BaseModel, ImmutableBase  # noqa: F401
 
 # 독립 엔티티
@@ -31,6 +32,7 @@ from app.models.order import (  # noqa: F401
 from app.models.import_job import ImportJob, AuditLog  # noqa: F401
 
 __all__ = [
+    "Base",
     "BaseModel",
     "ImmutableBase",
     "User",
