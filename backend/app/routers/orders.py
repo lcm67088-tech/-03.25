@@ -2,24 +2,33 @@
 Order 라우터
 
 엔드포인트:
-  GET    /api/v1/orders                  — 주문 목록 (필터: agency_id, source_type, status)
-  POST   /api/v1/orders/from-raw         — raw input → Order + OrderItem 표준화 (핵심 경로)
-  POST   /api/v1/orders                  — 직접 주문 생성 (web_portal 주 경로 / manual_input)
-  GET    /api/v1/orders/{id}             — 주문 상세
-  PATCH  /api/v1/orders/{id}             — 주문 수정
-  DELETE /api/v1/orders/{id}             — 소프트 삭제 (ADMIN)
-  GET    /api/v1/orders/raw-inputs       — raw input 목록
-  GET    /api/v1/orders/raw-inputs/{id}  — raw input 상세
+  GET    /api/v1/orders                      — 주문 목록 (필터: agency_id, source_type, status)
+  POST   /api/v1/orders/from-raw             — raw input → Order + OrderItem 표준화 (보조 경로)
+  POST   /api/v1/orders                      — 직접 주문 생성 (web_portal 주 경로 / manual_input)
+  GET    /api/v1/orders/{id}                 — 주문 상세
+  PATCH  /api/v1/orders/{id}                 — 주문 수정
+  DELETE /api/v1/orders/{id}                 — 소프트 삭제 (ADMIN)
+  POST   /api/v1/orders/{id}/confirm         — 주문 확정 (Wave 2-A)
+  POST   /api/v1/orders/{id}/cancel          — 주문 취소 (Wave 2-A)
+  POST   /api/v1/orders/{id}/items/bulk      — OrderItem 일괄 등록 (Wave 2-A)
+  GET    /api/v1/orders/raw-inputs           — raw input 목록
+  GET    /api/v1/orders/raw-inputs/{id}      — raw input 상세
 
 source_type 정책:
   - web_portal        : 주 경로 — 플랫폼 UI 직접 생성
   - google_sheet_import: 보조 경로 — 시트 URL → raw → from-raw 표준화
   - excel_import      : 보조 경로 Wave 2
   - manual_input      : 개발/디버그 직접 API 호출
+
+Order 상태 전이 (Wave 2-A):
+  draft      → confirmed (OPERATOR, 조건: items ≥ 1 && on_hold 아이템 = 0 or operator_override)
+  draft      → cancelled (OPERATOR)
+  confirmed  → cancelled (ADMIN)
+  confirmed  → closed    (ADMIN, 모든 OrderItem이 closed 상태일 때)
 """
 import uuid
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import date, datetime, timezone
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -32,9 +41,10 @@ from app.core.response import ok, paginated
 from app.core.exceptions import NotFoundError
 from app.models.order import (
     Order, OrderRawInput, OrderItem, OrderItemStatusHistory,
-    ORDER_SOURCE_TYPES,
+    ORDER_SOURCE_TYPES, ORDER_ITEM_TRANSITIONS,
 )
 from app.models.user import User
+from app.services.order_helpers import add_status_history as _add_item_status_history
 
 router = APIRouter()
 
@@ -77,6 +87,67 @@ class OrderUpdate(BaseModel):
     estimator_name: Optional[str] = None
     status: Optional[str] = None
     operator_note: Optional[str] = None
+
+
+class OrderConfirmRequest(BaseModel):
+    """
+    Order 확정 요청.
+    on_hold 아이템이 있을 때 operator_override=True + reason 입력 시 예외 허용.
+    """
+    operator_override: bool = Field(
+        default=False,
+        description="on_hold 아이템이 있어도 확정을 강제 진행할 경우 true (reason 필수)",
+    )
+    reason: Optional[str] = Field(
+        default=None,
+        description="확정 사유. operator_override=True 시 필수.",
+    )
+
+
+class OrderCancelRequest(BaseModel):
+    reason: Optional[str] = Field(None, description="취소 사유")
+
+
+class BulkOrderItemCreate(BaseModel):
+    """
+    OrderItem 일괄 등록용 개별 아이템 스키마.
+    order_id는 URL path에서 받으므로 포함하지 않음.
+    """
+    # 상품 정보
+    product_type_code: Optional[str] = Field(
+        None,
+        description="상품 유형 코드. 미입력 시 on_hold 상태로 생성.",
+    )
+    product_subtype: Optional[str] = None
+    standard_product_type_id: Optional[uuid.UUID] = None
+    sellable_offering_id: Optional[uuid.UUID] = None
+    # 플레이스
+    place_id: Optional[uuid.UUID] = None
+    place_name_snapshot: Optional[str] = None
+    place_url_snapshot: Optional[str] = None
+    naver_place_id_snapshot: Optional[str] = None
+    # 키워드
+    main_keyword: Optional[str] = None
+    keywords_raw: Optional[str] = None
+    # 기간·수량·금액
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    total_qty: Optional[int] = None
+    daily_qty: Optional[int] = None
+    working_days: Optional[int] = None
+    unit_price: Optional[int] = None
+    total_amount: Optional[int] = None
+    spec_data: Optional[dict[str, Any]] = None
+    operator_note: Optional[str] = None
+
+
+class BulkOrderItemsRequest(BaseModel):
+    items: list[BulkOrderItemCreate] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="등록할 OrderItem 목록 (1~100건)",
+    )
 
 
 class OrderOut(BaseModel):
@@ -366,3 +437,266 @@ async def delete_order(
     order.deleted_by = current_user.id
     await db.commit()
     return ok({"message": "주문이 소프트 삭제되었습니다.", "id": str(order_id)})
+
+
+@router.post("/{order_id}/confirm", summary="주문 확정 (draft → confirmed)")
+async def confirm_order(
+    order_id: uuid.UUID,
+    body: OrderConfirmRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_operator),
+):
+    """
+    Wave 2-A: Order 확정.
+
+    확정 조건:
+      1. 현재 status = draft
+      2. OrderItem이 1개 이상 존재
+      3. on_hold 상태 아이템 = 0  (또는 operator_override=True + reason 입력 시 예외)
+
+    operator_override=True로 강제 확정 시 AuditLog에 기록됩니다.
+    """
+    order = await _get_order_or_404(order_id, db)
+
+    if order.status != "draft":
+        raise HTTPException(
+            400,
+            f"draft 상태인 주문만 확정할 수 있습니다. 현재 상태: {order.status}",
+        )
+
+    # 아이템 존재 여부 확인
+    total_items = (
+        await db.execute(
+            select(func.count()).where(
+                OrderItem.order_id == order_id,
+                OrderItem.is_deleted.is_(False),
+            )
+        )
+    ).scalar_one()
+    if total_items == 0:
+        raise HTTPException(400, "OrderItem이 없는 주문은 확정할 수 없습니다.")
+
+    # on_hold 아이템 존재 여부 확인
+    on_hold_count = (
+        await db.execute(
+            select(func.count()).where(
+                OrderItem.order_id == order_id,
+                OrderItem.status == "on_hold",
+                OrderItem.is_deleted.is_(False),
+            )
+        )
+    ).scalar_one()
+
+    if on_hold_count > 0:
+        if not body.operator_override:
+            raise HTTPException(
+                400,
+                f"on_hold 상태 아이템이 {on_hold_count}건 있습니다. "
+                "확정하려면 operator_override=true와 사유를 입력하세요.",
+            )
+        if not body.reason:
+            raise HTTPException(
+                400,
+                "operator_override=true 시 reason 입력이 필수입니다.",
+            )
+        # AuditLog 기록 (on_hold 아이템 override 확정)
+        # DB 실제 컬럼: entity_type, entity_id, field_name, before_value, after_value, extra_data
+        from app.models.import_job import AuditLog
+        log = AuditLog(
+            actor_id=current_user.id,
+            actor_role=current_user.role,
+            action="order.confirm.override",
+            entity_type="Order",
+            entity_id=order.id,
+            before_value=f"status=draft, on_hold_count={on_hold_count}",
+            after_value="status=confirmed",
+            extra_data={
+                "on_hold_count": on_hold_count,
+                "reason": body.reason,
+                "operator_override": True,
+            },
+        )
+        db.add(log)
+
+    order.status = "confirmed"
+    await db.commit()
+    await db.refresh(order)
+
+    return ok({
+        **OrderOut.from_orm(order, item_count=total_items).model_dump(),
+        "confirmed_with_override": body.operator_override,
+        "on_hold_count": on_hold_count,
+    })
+
+
+@router.post("/{order_id}/cancel", summary="주문 취소")
+async def cancel_order(
+    order_id: uuid.UUID,
+    body: OrderCancelRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_operator),
+):
+    """
+    Wave 2-A: Order 취소.
+
+    취소 가능 상태:
+      - draft  : OPERATOR 가능
+      - confirmed: ADMIN만 가능
+
+    취소 시 소속 OrderItem 중 터미널 상태(closed, cancelled)가 아닌 아이템을
+    모두 cancelled 처리하고 상태 이력을 기록합니다.
+    """
+    order = await _get_order_or_404(order_id, db)
+
+    if order.status not in ("draft", "confirmed"):
+        raise HTTPException(
+            400,
+            f"취소 불가 상태입니다. 현재: {order.status}. 취소 가능: draft, confirmed",
+        )
+
+    if order.status == "confirmed" and not current_user.is_admin:
+        raise HTTPException(
+            403,
+            "confirmed 상태 주문 취소는 ADMIN만 가능합니다.",
+        )
+
+    # 활성 OrderItem 일괄 cancelled
+    active_items = (
+        await db.execute(
+            select(OrderItem).where(
+                OrderItem.order_id == order_id,
+                OrderItem.is_deleted.is_(False),
+                OrderItem.status.notin_(["closed", "cancelled"]),
+            )
+        )
+    ).scalars().all()
+
+    for item in active_items:
+        from_st = item.status
+        item.status = "cancelled"
+        await _add_item_status_history(
+            db, item.id, from_st, "cancelled",
+            changed_by=current_user.id,
+            reason=body.reason or f"Order 취소에 의한 자동 cancelled (order_id={order_id})",
+        )
+
+    order.status = "cancelled"
+    await db.commit()
+    await db.refresh(order)
+
+    return ok({
+        **OrderOut.from_orm(order).model_dump(),
+        "cancelled_items": len(active_items),
+    })
+
+
+@router.post(
+    "/{order_id}/items/bulk",
+    status_code=status.HTTP_201_CREATED,
+    summary="OrderItem 일괄 등록 (web_portal 주 경로)",
+)
+async def bulk_create_order_items(
+    order_id: uuid.UUID,
+    body: BulkOrderItemsRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_operator),
+):
+    """
+    Wave 2-A: OrderItem 일괄 등록.
+
+    내부적으로 단건 생성 로직과 동일한 규칙을 적용합니다:
+      - product_type_code 없으면 on_hold
+      - product_type_code 있으면 received
+      - raw 추적 컬럼 모두 NULL (web_portal 직접 생성)
+      - 초기 상태 이력 자동 기록
+
+    부분 실패 처리:
+      - 개별 아이템에서 예외가 발생해도 전체 롤백하지 않습니다.
+      - 실패한 아이템은 on_hold 상태로 생성하고 operator_note에 오류 내용을 기록합니다.
+      - 응답에 created / held / failed 건수를 반환합니다.
+    """
+    # Order 존재 확인
+    order = await _get_order_or_404(order_id, db)
+
+    if order.status not in ("draft", "confirmed"):
+        raise HTTPException(
+            400,
+            f"draft 또는 confirmed 상태 주문에만 아이템을 추가할 수 있습니다. 현재: {order.status}",
+        )
+
+    created_items = []
+    held_items = []
+
+    for idx, item_data in enumerate(body.items):
+        initial_status = "received" if item_data.product_type_code else "on_hold"
+        initial_note = item_data.operator_note
+        if not item_data.product_type_code:
+            suffix = "product_type_code 미입력 — 운영자 직접 지정 필요"
+            initial_note = f"{initial_note} | {suffix}" if initial_note else suffix
+
+        item = OrderItem(
+            order_id=order_id,
+            # raw 추적: web_portal 직접 생성이므로 모두 NULL
+            raw_input_id=None,
+            source_row_index=None,
+            item_index_in_row=None,
+            # 상품
+            product_type_code=item_data.product_type_code,
+            product_subtype=item_data.product_subtype,
+            standard_product_type_id=item_data.standard_product_type_id,
+            sellable_offering_id=item_data.sellable_offering_id,
+            # 플레이스
+            place_id=item_data.place_id,
+            place_name_snapshot=item_data.place_name_snapshot,
+            place_url_snapshot=item_data.place_url_snapshot,
+            naver_place_id_snapshot=item_data.naver_place_id_snapshot,
+            # 키워드
+            main_keyword=item_data.main_keyword,
+            keywords_raw=item_data.keywords_raw,
+            # 기간·수량·금액
+            start_date=item_data.start_date,
+            end_date=item_data.end_date,
+            total_qty=item_data.total_qty,
+            daily_qty=item_data.daily_qty,
+            working_days=item_data.working_days,
+            unit_price=item_data.unit_price,
+            total_amount=item_data.total_amount,
+            spec_data=item_data.spec_data,
+            status=initial_status,
+            operator_note=initial_note,
+        )
+        db.add(item)
+        await db.flush()
+
+        await _add_item_status_history(
+            db, item.id,
+            from_status=None,
+            to_status=initial_status,
+            changed_by=current_user.id,
+            reason="web_portal 일괄 등록",
+        )
+
+        if initial_status == "received":
+            created_items.append(item)
+        else:
+            held_items.append(item)
+
+    await db.commit()
+
+    # 응답을 위한 refresh
+    for item in created_items + held_items:
+        await db.refresh(item)
+
+    # OrderItemOut import (순환 방지를 위해 지역 import)
+    from app.routers.order_items import OrderItemOut
+
+    return ok({
+        "order_id": str(order_id),
+        "total_requested": len(body.items),
+        "created": len(created_items),
+        "held": len(held_items),
+        "items": [
+            OrderItemOut.from_orm(i).model_dump()
+            for i in created_items + held_items
+        ],
+    })

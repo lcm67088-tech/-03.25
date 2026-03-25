@@ -12,16 +12,22 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
+# passlib CryptContext — fallback 유지
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
-# ── 비밀번호 ──────────────────────────────────────────────────
+# ── 비밀번호 (bcrypt 직접 사용 — passlib 72바이트 제한 버그 우회) ─────
 def hash_password(plain: str) -> str:
-    return pwd_context.hash(plain)
+    import bcrypt as _bcrypt
+    return _bcrypt.hashpw(plain.encode("utf-8"), _bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    import bcrypt as _bcrypt
+    try:
+        return _bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
 
 
 # ── JWT ───────────────────────────────────────────────────────

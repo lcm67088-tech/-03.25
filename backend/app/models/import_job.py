@@ -94,6 +94,10 @@ class AuditLog(ImmutableBase):
     전체 도메인 감사 로그 — 불변 저장
     INSERT 전용. 모든 주요 변경·전이에 기록.
     actor_id는 SET NULL (사용자 삭제 시 로그 보존).
+
+    DB 실제 컬럼 (001_initial_schema.py 기준):
+      id, actor_id, actor_role, entity_type, entity_id,
+      action, field_name, before_value, after_value, extra_data, created_at
     """
     __tablename__ = "audit_logs"
     __table_args__ = {
@@ -112,12 +116,12 @@ class AuditLog(ImmutableBase):
     )
 
     # ── 대상 ─────────────────────────────────────────────────
-    target_type: Mapped[str] = mapped_column(
+    entity_type: Mapped[Optional[str]] = mapped_column(
         String(100),
-        nullable=False,
+        nullable=True,
         comment="대상 엔티티 유형: Place | Order | OrderItem | ImportJob | ...",
     )
-    target_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+    entity_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),
         nullable=True,
         index=True,
@@ -130,25 +134,20 @@ class AuditLog(ImmutableBase):
         nullable=False,
         comment="create | update | delete | status_change | confirm | assign | import | ...",
     )
-    before_data: Mapped[Optional[dict[str, Any]]] = mapped_column(
-        JSONB, nullable=True, comment="변경 전 데이터"
+    field_name: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True, comment="변경된 필드명"
     )
-    after_data: Mapped[Optional[dict[str, Any]]] = mapped_column(
-        JSONB, nullable=True, comment="변경 후 데이터"
+    before_value: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, comment="변경 전 값 (텍스트 직렬화)"
     )
-    detail: Mapped[Optional[str]] = mapped_column(
-        Text, nullable=True, comment="추가 설명"
+    after_value: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, comment="변경 후 값 (텍스트 직렬화)"
     )
-
-    # ── 요청 컨텍스트 ─────────────────────────────────────────
-    ip_address: Mapped[Optional[str]] = mapped_column(
-        String(50), nullable=True
-    )
-    user_agent: Mapped[Optional[str]] = mapped_column(
-        String(300), nullable=True
+    extra_data: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=True, comment="추가 컨텍스트 (JSONB)"
     )
 
     def __repr__(self) -> str:
         return (
-            f"<AuditLog {self.action} on {self.target_type}:{self.target_id}>"
+            f"<AuditLog {self.action} on {self.entity_type}:{self.entity_id}>"
         )

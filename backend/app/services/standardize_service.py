@@ -235,6 +235,8 @@ async def standardize_raw_input(
             order_id=order.id,
             item_index=idx,
             spec=spec,
+            raw_input_id=raw.id,
+            source_row_index=raw.source_row_index,
         )
         db.add(item)
         await db.flush()  # item.id 확보
@@ -269,12 +271,17 @@ async def _build_order_item(
     order_id: uuid.UUID,
     item_index: int,
     spec: dict[str, Any],
+    raw_input_id: Optional[uuid.UUID] = None,
+    source_row_index: Optional[int] = None,
 ) -> OrderItem:
     """
     단일 spec dict → OrderItem 변환.
     매핑 불확실 시 on_hold 반환.
 
-    컬럼명: 마이그레이션 기준 (001_initial_schema.py)
+    컬럼명: 마이그레이션 기준 (002 — raw 추적 컬럼 포함)
+      raw_input_id      — loose ref (FK 없음). standardize 경유 시 채워넣음.
+      source_row_index  — 원본 시트/파일 행 번호 (OrderRawInput.source_row_index)
+      item_index_in_row — 같은 행 내 아이템 순번 (0-based, item_index 파라미터)
     """
     product_type_code, product_subtype = _infer_product_type(
         spec, spec.get("__sheet__")
@@ -336,24 +343,38 @@ async def _build_order_item(
 
     return OrderItem(
         order_id=order_id,
+        # ── raw 추적 컬럼 (B안 · 마이그레이션 002) ──────────────
+        raw_input_id=raw_input_id,          # loose ref, FK 없음
+        source_row_index=source_row_index,  # 원본 시트 행 번호
+        item_index_in_row=item_index,       # 행 내 아이템 순번 (0-based)
+        # ── 플레이스 ────────────────────────────────────────────
         place_id=place_id,
         place_name_snapshot=place_name,
         place_url_snapshot=place_url,
         naver_place_id_snapshot=naver_place_id_snapshot,
+        # ── 상품 ────────────────────────────────────────────────
         product_type_code=product_type_code,
         product_subtype=product_subtype,
+        # ── 키워드 ──────────────────────────────────────────────
         main_keyword=main_keyword,
         keywords_raw=keywords_raw_value,
+        # ── 기간·수량 ────────────────────────────────────────────
         start_date=start_date,
         end_date=end_date,
         daily_qty=daily_qty,
         total_qty=total_qty,
+        # ── 보조 데이터 (spec_data에도 raw 추적 정보 병기) ──────
         spec_data={
             "source_columns": {
                 k: str(v) for k, v in spec.items()
                 if k not in ("items", "__sheet__") and v is not None
             },
-            "item_index_in_raw": item_index,
+            # spec_data에도 추적 정보 병기 (B안 구조화 컬럼이 primary)
+            "raw_tracking": {
+                "raw_input_id": str(raw_input_id) if raw_input_id else None,
+                "source_row_index": source_row_index,
+                "item_index_in_row": item_index,
+            },
         },
         status=item_status,
         operator_note=status_note,

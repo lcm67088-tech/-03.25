@@ -159,7 +159,22 @@ class OrderItem(BaseModel):
         UUID(as_uuid=True), ForeignKey("orders.id", ondelete="RESTRICT"),
         nullable=False, index=True,
     )
-    # 표준 상품 유형 FK (nullable — 미매핑 허용)
+    # ── raw 추적 컬럼 (B안 · Wave 1 보강) ─────────────────────
+    # loose reference: FK 제약 없음 — OrderRawInput 삭제/정리 시 영향 없음
+    # web_portal 직접 생성 시 세 컬럼 모두 NULL
+    raw_input_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True, index=True,
+        comment="OrderRawInput UUID. loose ref (FK 없음). web_portal 직접 생성 시 NULL.",
+    )
+    source_row_index: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="원본 시트/파일 행 번호 (0-based). raw 경유 생성 시 채워넣음.",
+    )
+    item_index_in_row: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="같은 raw 행 내 아이템 순번 (0-based). 1 row → N items 분기 추적.",
+    )
+    # ── 표준 상품 유형 FK (nullable — 미매핑 허용)
     standard_product_type_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("standard_product_types.id", ondelete="SET NULL"),

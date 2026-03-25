@@ -1,6 +1,8 @@
 """
 AuditLog 라우터
 GET /api/v1/audit  — 감사 로그 조회 (ADMIN)
+
+DB 실제 컬럼: entity_type, entity_id, field_name, before_value, after_value, extra_data
 """
 import uuid
 from typing import Optional
@@ -23,8 +25,8 @@ async def list_audit_logs(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     actor_id: Optional[uuid.UUID] = Query(None),
-    target_type: Optional[str] = Query(None),
-    target_id: Optional[uuid.UUID] = Query(None),
+    entity_type: Optional[str] = Query(None, description="예: Order, OrderItem, Place"),
+    entity_id: Optional[uuid.UUID] = Query(None),
     action: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_admin),
@@ -32,10 +34,10 @@ async def list_audit_logs(
     q = select(AuditLog)
     if actor_id:
         q = q.where(AuditLog.actor_id == actor_id)
-    if target_type:
-        q = q.where(AuditLog.target_type == target_type)
-    if target_id:
-        q = q.where(AuditLog.target_id == target_id)
+    if entity_type:
+        q = q.where(AuditLog.entity_type == entity_type)
+    if entity_id:
+        q = q.where(AuditLog.entity_id == entity_id)
     if action:
         q = q.where(AuditLog.action == action)
 
@@ -53,13 +55,13 @@ async def list_audit_logs(
                 "id": str(lg.id),
                 "actor_id": str(lg.actor_id) if lg.actor_id else None,
                 "actor_role": lg.actor_role,
-                "target_type": lg.target_type,
-                "target_id": str(lg.target_id) if lg.target_id else None,
+                "entity_type": lg.entity_type,
+                "entity_id": str(lg.entity_id) if lg.entity_id else None,
                 "action": lg.action,
-                "before_data": lg.before_data,
-                "after_data": lg.after_data,
-                "detail": lg.detail,
-                "ip_address": lg.ip_address,
+                "field_name": lg.field_name,
+                "before_value": lg.before_value,
+                "after_value": lg.after_value,
+                "extra_data": lg.extra_data,
                 "created_at": lg.created_at.isoformat(),
             }
             for lg in rows

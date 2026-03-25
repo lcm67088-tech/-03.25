@@ -1,4 +1,9 @@
-"""AuditLog 기록 서비스 (공통 유틸)"""
+"""AuditLog 기록 서비스 (공통 유틸)
+
+DB 실제 컬럼 (001_initial_schema.py 기준):
+  id, actor_id, actor_role, entity_type, entity_id,
+  action, field_name, before_value, after_value, extra_data, created_at
+"""
 import uuid
 from typing import Any, Optional
 
@@ -12,13 +17,12 @@ async def record_audit(
     db: AsyncSession,
     actor: Optional[User],
     action: str,
-    domain: str,
-    target_id: Optional[uuid.UUID] = None,
-    target_type: Optional[str] = None,
-    before_snapshot: Optional[dict[str, Any]] = None,
-    after_snapshot: Optional[dict[str, Any]] = None,
-    detail: Optional[str] = None,
-    request_id: Optional[str] = None,
+    entity_type: Optional[str] = None,
+    entity_id: Optional[uuid.UUID] = None,
+    field_name: Optional[str] = None,
+    before_value: Optional[str] = None,
+    after_value: Optional[str] = None,
+    extra_data: Optional[dict[str, Any]] = None,
 ) -> AuditLog:
     """
     AuditLog를 INSERT하고 반환.
@@ -28,17 +32,14 @@ async def record_audit(
     log = AuditLog(
         actor_id=actor.id if actor else None,
         actor_role=actor.role if actor else None,
-        actor_email_snapshot=actor.email if actor else None,
         action=action,
-        domain=domain,
-        target_id=target_id,
-        target_type=target_type or domain,
-        before_snapshot=before_snapshot,
-        after_snapshot=after_snapshot,
-        detail=detail,
-        request_id=request_id,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        field_name=field_name,
+        before_value=before_value,
+        after_value=after_value,
+        extra_data=extra_data,
     )
     db.add(log)
-    # flush — 같은 트랜잭션에 포함, commit은 호출자가 담당
     await db.flush()
     return log

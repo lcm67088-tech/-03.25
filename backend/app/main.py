@@ -15,7 +15,7 @@ Wave 1 라우터 목록:
   /api/v1/agencies                — 대행사
   /api/v1/brands                  — 브랜드
   /api/v1/audit-logs              — 감사 로그
-  /api/v1/dashboard               — 운영 요약
+  /api/v1/dashboard               — 운영 요약 (Wave 1 호환 + Wave 2-A 확장)
 """
 from contextlib import asynccontextmanager
 
@@ -39,6 +39,7 @@ from app.routers.providers import (
 )
 from app.routers.order_items import router as order_items_router
 from app.routers.audit import router as audit_router
+from app.routers.dashboard import router as dashboard_router
 
 settings = get_settings()
 
@@ -95,6 +96,7 @@ app.include_router(agency_router,       prefix=API_PREFIX,              tags=["a
 app.include_router(brand_router,        prefix=API_PREFIX,              tags=["brands"])
 # Infra
 app.include_router(audit_router,        prefix=API_PREFIX,              tags=["audit"])
+app.include_router(dashboard_router,    prefix=f"{API_PREFIX}/dashboard", tags=["dashboard"])
 
 
 @app.get("/health", tags=["health"])
