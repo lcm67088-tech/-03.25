@@ -17,9 +17,8 @@ export default function OrderItemHistoryPage() {
     if (!itemId) return
     api.get(`/order-items/${itemId}/history`)
       .then((r) => {
-        const d = r.data as { data?: OrderItemStatusHistory[]; items?: OrderItemStatusHistory[] } | OrderItemStatusHistory[]
-        if (Array.isArray(d)) setHistory(d)
-        else setHistory(d.data ?? d.items ?? [])
+        const d = r.data as { data: OrderItemStatusHistory[] }
+        setHistory(d.data ?? [])
       })
       .catch(() => toast('이력 로드 실패', 'error'))
       .finally(() => setLoading(false))

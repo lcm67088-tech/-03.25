@@ -31,24 +31,26 @@ router = APIRouter()
 # ── 스키마 ───────────────────────────────────────────────────────
 
 class ImportJobCreate(BaseModel):
-    job_type: str                   # place_import | order_import
+    job_type: str                        # place_import | order_import
     source_type: str = "google_sheet_import"  # google_sheet_import | excel_import
-    source_ref: str                 # Google Sheet URL 또는 파일명
-    sheet_name: Optional[str] = None  # 특정 시트명 (미지정 시 기본 시트)
+    source_url: Optional[str] = None    # Google Sheet URL
+    source_file_name: Optional[str] = None  # 업로드 파일명
+    source_sheet_name: Optional[str] = None  # 특정 시트명 (미지정 시 기본 시트)
 
 
 class ImportJobOut(BaseModel):
     id: str
     job_type: str
     source_type: str
-    source_ref: Optional[str]
-    sheet_name: Optional[str]
+    source_url: Optional[str]
+    source_file_name: Optional[str]
+    source_sheet_name: Optional[str]
     status: str
     total_rows: Optional[int]
-    success_rows: Optional[int]
+    processed_rows: Optional[int]
     failed_rows: Optional[int]
-    error_log: Optional[dict]
-    result_summary: Optional[dict]
+    retry_count: int
+    error_message: Optional[str]
     requested_by: Optional[str]
     created_at: datetime
     updated_at: datetime
@@ -59,14 +61,15 @@ class ImportJobOut(BaseModel):
             id=str(j.id),
             job_type=j.job_type,
             source_type=j.source_type,
-            source_ref=j.source_ref,
-            sheet_name=j.sheet_name,
+            source_url=j.source_url,
+            source_file_name=j.source_file_name,
+            source_sheet_name=j.source_sheet_name,
             status=j.status,
             total_rows=j.total_rows,
-            success_rows=j.success_rows,
+            processed_rows=j.processed_rows,
             failed_rows=j.failed_rows,
-            error_log=j.error_log,
-            result_summary=j.result_summary,
+            retry_count=j.retry_count,
+            error_message=j.error_message,
             requested_by=str(j.requested_by) if j.requested_by else None,
             created_at=j.created_at,
             updated_at=j.updated_at,
@@ -104,8 +107,9 @@ async def create_import_job(
     job = ImportJob(
         job_type=body.job_type,
         source_type=body.source_type,
-        source_ref=body.source_ref,
-        sheet_name=body.sheet_name,
+        source_url=body.source_url,
+        source_file_name=body.source_file_name,
+        source_sheet_name=body.source_sheet_name,
         status="pending",
         requested_by=current_user.id,
     )

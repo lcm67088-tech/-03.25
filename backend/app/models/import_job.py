@@ -36,15 +36,20 @@ class ImportJob(BaseModel):
         nullable=False,
         comment="google_sheet_import(1차) | excel_import(보조)",
     )
-    source_ref: Mapped[Optional[str]] = mapped_column(
-        String(500),
+    source_url: Mapped[Optional[str]] = mapped_column(
+        String(1000),
         nullable=True,
-        comment="Google Sheet URL 또는 파일명",
+        comment="Google Sheet URL",
     )
-    sheet_name: Mapped[Optional[str]] = mapped_column(
+    source_sheet_name: Mapped[Optional[str]] = mapped_column(
         String(200),
         nullable=True,
         comment="Google Sheet 특정 시트명 (미지정 시 기본 시트)",
+    )
+    source_file_name: Mapped[Optional[str]] = mapped_column(
+        String(500),
+        nullable=True,
+        comment="업로드 파일명",
     )
 
     # ── 상태 ─────────────────────────────────────────────────
@@ -59,25 +64,37 @@ class ImportJob(BaseModel):
     total_rows: Mapped[Optional[int]] = mapped_column(
         Integer, nullable=True, comment="전체 처리 행 수"
     )
-    success_rows: Mapped[Optional[int]] = mapped_column(
-        Integer, nullable=True, comment="성공 행 수"
+    processed_rows: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, comment="처리 완료 행 수"
     )
     failed_rows: Mapped[Optional[int]] = mapped_column(
         Integer, nullable=True, comment="실패 행 수"
     )
 
-    error_log: Mapped[Optional[dict[str, Any]]] = mapped_column(
-        JSONB,
+    error_message: Mapped[Optional[str]] = mapped_column(
+        Text,
         nullable=True,
-        comment="실패 상세 로그 [{row, error}, ...]",
+        comment="실패 메시지",
     )
-    result_summary: Mapped[Optional[dict[str, Any]]] = mapped_column(
+    error_detail: Mapped[Optional[dict[str, Any]]] = mapped_column(
         JSONB,
         nullable=True,
-        comment="완료 후 결과 요약",
+        comment="실패 상세 로그 (JSONB)",
     )
 
     # ── 요청자 ────────────────────────────────────────────────
+    retry_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+        comment="재시도 횟수",
+    )
+    parent_job_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        comment="재시도 시 원본 Job ID",
+    )
     requested_by: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="SET NULL"),
@@ -86,7 +103,7 @@ class ImportJob(BaseModel):
     )
 
     def __repr__(self) -> str:
-        return f"<ImportJob {self.job_type} [{self.status}] src={self.source_ref}>"
+        return f"<ImportJob {self.job_type} [{self.status}] src={self.source_url}>"
 
 
 class AuditLog(ImmutableBase):

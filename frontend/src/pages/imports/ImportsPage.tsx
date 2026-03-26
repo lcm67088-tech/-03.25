@@ -16,10 +16,9 @@ export default function ImportsPage() {
   const load = async (p = page) => {
     setLoading(true)
     try {
-      const { data: resp } = await api.get('/import-jobs', { params: { page: p, page_size: 20 } })
-      const d = resp as { data?: ImportJob[]; items?: ImportJob[]; total?: number }
-      setJobs(d.data ?? d.items ?? [])
-      setTotal(d.total ?? 0)
+      const { data: resp } = await api.get<{ data: ImportJob[]; meta: { total: number } }>('/import-jobs', { params: { page: p, page_size: 20 } })
+      setJobs(resp.data ?? [])
+      setTotal(resp.meta?.total ?? 0)
     } catch {
       toast('ImportJob 로드 실패', 'error')
     } finally {

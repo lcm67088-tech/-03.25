@@ -5,31 +5,70 @@ import { FullPageSpinner } from '@/components/ui/Spinner'
 import { formatAmount } from '@/lib/utils'
 import { toast } from '@/components/ui/Toast'
 
-interface DashboardSummary {
-  order_status_totals: Record<string, number>
-  item_status_totals: Record<string, number>
-  amount_totals: Record<string, number>
+// 실제 백엔드 응답 구조 (GET /api/v1/dashboard/summary)
+interface SummaryData {
+  orders: {
+    total: number
+    draft: number
+    confirmed: number
+    cancelled: number
+    closed: number
+  }
+  order_items: {
+    total: number
+    received: number
+    on_hold: number
+    reviewing: number
+    ready_to_route: number
+    assigned: number
+    in_progress: number
+    done: number
+    confirmed: number
+    settlement_ready: number
+    closed: number
+    cancelled: number
+  }
+  amounts: {
+    in_progress: number
+    done: number
+    settlement_ready: number
+    closed: number
+    total_contracted: number
+  }
+  place: {
+    total: number
+    pending_review: number
+    in_review: number
+    confirmed: number
+    rejected: number
+  }
 }
 
-interface ItemsByStatus {
-  by_status: Record<string, { count: number; total_amount: number }>
+// 실제 백엔드 응답 구조 (GET /api/v1/dashboard/items-by-status)
+interface ItemsByStatusRow {
+  status: string
+  count: number
+  total_amount: number
+  avg_unit_price: number
+}
+interface ItemsByStatusData {
+  source_type_filter: string | null
+  statuses: ItemsByStatusRow[]
 }
 
 export default function DashboardPage() {
-  const [summary, setSummary] = useState<DashboardSummary | null>(null)
-  const [itemsByStatus, setItemsByStatus] = useState<ItemsByStatus | null>(null)
-  const [loading, setLoading] = useState(true)
+  const [summary, setSummary]         = useState<SummaryData | null>(null)
+  const [itemsByStatus, setItemsByStatus] = useState<ItemsByStatusRow[]>([])
+  const [loading, setLoading]         = useState(true)
 
   useEffect(() => {
     Promise.all([
-      api.get<{ data: DashboardSummary } | DashboardSummary>('/dashboard/summary'),
-      api.get<{ data: ItemsByStatus } | ItemsByStatus>('/dashboard/items-by-status'),
+      api.get<{ data: SummaryData }>('/dashboard/summary'),
+      api.get<{ data: ItemsByStatusData }>('/dashboard/items-by-status'),
     ])
       .then(([s, i]) => {
-        const sd = ('data' in s.data && s.data.data) ? s.data.data : s.data as DashboardSummary
-        const id = ('data' in i.data && i.data.data) ? i.data.data : i.data as ItemsByStatus
-        setSummary(sd)
-        setItemsByStatus(id)
+        setSummary(s.data.data)
+        setItemsByStatus(i.data.data?.statuses ?? [])
       })
       .catch(() => toast('대시보드 로드 실패', 'error'))
       .finally(() => setLoading(false))
@@ -37,24 +76,22 @@ export default function DashboardPage() {
 
   if (loading) return <FullPageSpinner />
 
-  const orderTotals = summary?.order_status_totals ?? {}
-  const itemTotals  = summary?.item_status_totals  ?? {}
-  const amounts     = summary?.amount_totals        ?? {}
-
-  const totalOrders = Object.values(orderTotals).reduce((a, b) => a + b, 0)
+  const orders    = summary?.orders
+  const items     = summary?.order_items
+  const amounts   = summary?.amounts
 
   const statCards = [
-    { label: '전체 주문',     value: totalOrders,                         color: 'border-blue-400' },
-    { label: '진행중 아이템', value: itemTotals['in_progress'] ?? 0,      color: 'border-violet-400' },
-    { label: '정산대기',      value: itemTotals['settlement_ready'] ?? 0, color: 'border-amber-400' },
-    { label: '종료 아이템',   value: itemTotals['closed'] ?? 0,           color: 'border-emerald-400' },
+    { label: '전체 주문',     value: orders?.total   ?? 0, color: 'border-blue-400' },
+    { label: '진행중 아이템', value: items?.in_progress ?? 0, color: 'border-violet-400' },
+    { label: '정산대기',      value: items?.settlement_ready ?? 0, color: 'border-amber-400' },
+    { label: '종료 아이템',   value: items?.closed   ?? 0, color: 'border-emerald-400' },
   ]
 
   const amountRows = [
-    { label: '진행중',          key: 'in_progress',      color: 'text-violet-600' },
-    { label: '완료',            key: 'done',             color: 'text-green-600' },
-    { label: '정산대기',        key: 'settlement_ready', color: 'text-amber-600' },
-    { label: '종료(정산완료)', key: 'closed',           color: 'text-slate-500' },
+    { label: '진행중',           key: 'in_progress'      as const, color: 'text-violet-600' },
+    { label: '완료',             key: 'done'              as const, color: 'text-green-600' },
+    { label: '정산대기',         key: 'settlement_ready'  as const, color: 'text-amber-600' },
+    { label: '종료(정산완료)',   key: 'closed'            as const, color: 'text-slate-500' },
   ]
 
   return (
@@ -75,7 +112,7 @@ export default function DashboardPage() {
       </div>
 
       {/* 금액 현황 + 상태별 집계 */}
-      <div className="grid grid-cols-2 gap-6">
+      <div className="grid grid-cols-2 gap-6 mb-6">
         <div className="card">
           <h3 className="text-sm font-semibold text-slate-700 mb-4">💰 금액 현황</h3>
           <div className="space-y-3">
@@ -83,25 +120,57 @@ export default function DashboardPage() {
               <div key={key} className="flex justify-between items-center">
                 <span className="text-sm text-slate-500">{label}</span>
                 <span className={`font-semibold text-sm ${color}`}>
-                  {formatAmount(amounts[key])}
+                  {formatAmount(amounts?.[key] ?? 0)}
                 </span>
               </div>
             ))}
+            <div className="border-t border-slate-100 pt-3 flex justify-between items-center">
+              <span className="text-sm font-semibold text-slate-700">총 계약액</span>
+              <span className="font-bold text-sm text-slate-900">
+                {formatAmount(amounts?.total_contracted ?? 0)}
+              </span>
+            </div>
           </div>
         </div>
 
         <div className="card">
           <h3 className="text-sm font-semibold text-slate-700 mb-4">📊 OrderItem 상태별</h3>
           <div className="space-y-2">
-            {Object.entries(itemsByStatus?.by_status ?? {})
-              .slice(0, 7)
-              .map(([st, data]) => (
-                <div key={st} className="flex justify-between items-center">
-                  <StatusBadge status={st} />
-                  <span className="font-semibold text-sm text-slate-700">{data.count}건</span>
+            {itemsByStatus.slice(0, 8).map((row) => (
+              <div key={row.status} className="flex justify-between items-center">
+                <StatusBadge status={row.status} />
+                <div className="text-right">
+                  <span className="font-semibold text-sm text-slate-700">{row.count}건</span>
+                  {row.total_amount > 0 && (
+                    <span className="text-xs text-slate-400 ml-2">
+                      {formatAmount(row.total_amount)}
+                    </span>
+                  )}
                 </div>
-              ))}
+              </div>
+            ))}
           </div>
+        </div>
+      </div>
+
+      {/* 주문 상태별 요약 */}
+      <div className="card">
+        <h3 className="text-sm font-semibold text-slate-700 mb-4">📋 주문 상태별</h3>
+        <div className="grid grid-cols-5 gap-3">
+          {[
+            { label: '초안',   key: 'draft',    color: 'bg-slate-100 text-slate-600' },
+            { label: '확정',   key: 'confirmed', color: 'bg-cyan-50 text-cyan-700' },
+            { label: '종료',   key: 'closed',   color: 'bg-emerald-50 text-emerald-700' },
+            { label: '취소',   key: 'cancelled', color: 'bg-red-50 text-red-600' },
+            { label: '전체',   key: 'total',    color: 'bg-blue-50 text-blue-700' },
+          ].map(({ label, key, color }) => (
+            <div key={key} className={`rounded-lg p-3 text-center ${color}`}>
+              <p className="text-xs mb-1">{label}</p>
+              <p className="text-xl font-bold">
+                {orders?.[key as keyof typeof orders] ?? 0}
+              </p>
+            </div>
+          ))}
         </div>
       </div>
     </div>

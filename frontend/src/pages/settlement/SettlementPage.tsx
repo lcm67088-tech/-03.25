@@ -9,14 +9,29 @@ interface PipelineItem {
   total_amount: number
 }
 
+interface PendingAdminApproval {
+  count: number
+  total_amount: number
+  description: string
+}
+
 interface ClosedByAgency {
-  agency_label: string | null
+  agency_name: string | null  // 백엔드 실제 필드명
+  agency_id: string | null
   closed_count: number
   total_amount: number
 }
 
+interface TotalClosed {
+  count: number
+  total_amount: number
+}
+
 interface SettlementData {
+  filter?: Record<string, unknown>
   pipeline?: Record<string, PipelineItem>
+  pending_admin_approval?: PendingAdminApproval
+  total_closed?: TotalClosed
   closed_by_agency?: ClosedByAgency[]
 }
 
@@ -39,9 +54,8 @@ export default function SettlementPage() {
       const params: Record<string, string> = {}
       if (closedFrom) params.closed_from = closedFrom
       if (closedTo)   params.closed_to   = closedTo
-      const { data: resp } = await api.get('/dashboard/settlement', { params })
-      const d = resp as { data?: SettlementData } | SettlementData
-      setData(('data' in d && d.data) ? d.data : d as SettlementData)
+      const { data: resp } = await api.get<{ data: SettlementData }>('/dashboard/settlement', { params })
+      setData(resp.data ?? null)
     } catch {
       toast('정산 데이터 로드 실패', 'error')
     } finally {
@@ -87,7 +101,7 @@ export default function SettlementPage() {
         <FullPageSpinner />
       ) : data && (
         <>
-          {/* 파이프라인 */}
+          {/* 파이프라인 카드 */}
           <div className="grid grid-cols-4 gap-4 mb-6">
             {PIPELINE_STAGES.map(({ key, label, color }) => {
               const s = data.pipeline?.[key] ?? { count: 0, total_amount: 0 }
@@ -101,7 +115,36 @@ export default function SettlementPage() {
             })}
           </div>
 
-          {/* 대행사별 */}
+          {/* ADMIN 승인 대기 배너 */}
+          {data.pending_admin_approval && data.pending_admin_approval.count > 0 && (
+            <div className="card mb-6 border border-amber-300 bg-amber-50">
+              <div className="flex items-start gap-3">
+                <span className="text-xl">⚠️</span>
+                <div>
+                  <p className="text-sm font-bold text-amber-800">
+                    ADMIN 최종 승인 대기: {data.pending_admin_approval.count}건
+                    ({formatAmount(data.pending_admin_approval.total_amount)})
+                  </p>
+                  <p className="text-xs text-amber-600 mt-0.5">
+                    {data.pending_admin_approval.description}
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 전체 종료 요약 */}
+          {data.total_closed && (
+            <div className="card mb-6 border-l-4 border-green-500">
+              <p className="text-xs text-slate-500 mb-1">전체 종료 (정산완료)</p>
+              <p className="text-2xl font-bold text-slate-900">{data.total_closed.count}건</p>
+              <p className="text-sm font-semibold text-green-700 mt-1">
+                {formatAmount(data.total_closed.total_amount)}
+              </p>
+            </div>
+          )}
+
+          {/* 대행사별 정산 현황 */}
           <div className="card">
             <h3 className="text-sm font-semibold text-slate-700 mb-4">
               대행사별 정산 현황 (종료 기준)
@@ -118,14 +161,15 @@ export default function SettlementPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {(data.closed_by_agency ?? []).map((row, i) => (
-                    <tr key={i} className="hover:bg-slate-50 border-b border-slate-100 last:border-0">
-                      <td className="px-4 py-3 font-medium text-sm">{row.agency_label ?? '(미지정)'}</td>
-                      <td className="px-4 py-3 text-center font-semibold text-sm">{row.closed_count}</td>
-                      <td className="px-4 py-3 font-semibold text-sm text-green-700">{formatAmount(row.total_amount)}</td>
-                    </tr>
-                  ))}
-                  {(data.closed_by_agency ?? []).length === 0 && (
+                  {(data.closed_by_agency ?? []).length > 0 ? (
+                    (data.closed_by_agency ?? []).map((row, i) => (
+                      <tr key={i} className="hover:bg-slate-50 border-b border-slate-100 last:border-0">
+                        <td className="px-4 py-3 font-medium text-sm">{row.agency_name ?? '(미지정)'}</td>
+                        <td className="px-4 py-3 text-center font-semibold text-sm">{row.closed_count}</td>
+                        <td className="px-4 py-3 font-semibold text-sm text-green-700">{formatAmount(row.total_amount)}</td>
+                      </tr>
+                    ))
+                  ) : (
                     <tr>
                       <td colSpan={3} className="text-center py-8 text-slate-400">데이터 없음</td>
                     </tr>

@@ -37,10 +37,10 @@ export default function OrderDetailPage() {
         api.get(`/orders/${orderId}`),
         api.get('/order-items', { params: { order_id: orderId, page_size: 100 } }),
       ])
-      const od = oRes.data as { data?: Order } | Order
-      const id = iRes.data as { data?: OrderItem[]; items?: OrderItem[] }
-      setOrder(('data' in od && od.data) ? od.data : od as Order)
-      setItems(id.data ?? id.items ?? [])
+      const od = oRes.data as { data: Order }
+      const id = iRes.data as { data: OrderItem[] }
+      setOrder(od.data)
+      setItems(id.data ?? [])
     } catch {
       toast('주문 로드 실패', 'error')
     } finally {

@@ -17,10 +17,9 @@ export default function UsersPage() {
   const load = async () => {
     setLoading(true)
     try {
-      const { data: resp } = await api.get('/users')
-      const d = resp as { data?: User[]; items?: User[] } | User[]
-      if (Array.isArray(d)) setUsers(d)
-      else setUsers(d.data ?? d.items ?? [])
+      const { data: resp } = await api.get<User[]>('/users/')
+      // /users/ 는 list를 직접 반환
+      setUsers(Array.isArray(resp) ? resp : [])
     } catch {
       toast('사용자 목록 로드 실패', 'error')
     } finally {
@@ -33,7 +32,7 @@ export default function UsersPage() {
   const doCreate = async () => {
     setFormLoading(true)
     try {
-      await api.post('/users', form)
+      await api.post('/users/', form)
       toast('사용자가 생성되었습니다')
       setShowModal(false)
       setForm(EMPTY_FORM)

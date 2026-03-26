@@ -31,10 +31,9 @@ export default function OrdersPage() {
       if (f.status)      params.status      = f.status
       if (f.source_type) params.source_type = f.source_type
 
-      const { data: resp } = await api.get('/orders', { params })
-      const d = resp as { data?: Order[]; items?: Order[]; total?: number }
-      setOrders(d.data ?? d.items ?? [])
-      setTotal(d.total ?? 0)
+      const { data: resp } = await api.get<{ data: Order[]; meta: { total: number } }>('/orders', { params })
+      setOrders(resp.data ?? [])
+      setTotal(resp.meta?.total ?? 0)
     } catch {
       toast('주문 목록 로드 실패', 'error')
     } finally {

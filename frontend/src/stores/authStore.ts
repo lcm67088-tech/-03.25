@@ -22,20 +22,17 @@ export const useAuthStore = create<AuthState>((set) => ({
   user: loadUser(),
 
   login: async (email, password) => {
-    // FastAPI OAuth2PasswordRequestForm: application/x-www-form-urlencoded
-    const formData = new URLSearchParams({ username: email, password })
+    // PlaceOpt 백엔드: JSON body { email, password }
     const { data: tokenData } = await api.post<{ access_token: string }>(
-      '/auth/login',
-      formData,
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+      '/login',
+      { email, password }
     )
     localStorage.setItem(TOKEN_KEY, tokenData.access_token)
 
-    const { data: meResp } = await api.get<{ data: User } | User>('/auth/me')
-    const user = ('data' in meResp && meResp.data) ? meResp.data as User : meResp as User
-    localStorage.setItem(USER_KEY, JSON.stringify(user))
-    set({ user })
-    return user
+    const { data: meResp } = await api.get<User>('/me')
+    localStorage.setItem(USER_KEY, JSON.stringify(meResp))
+    set({ user: meResp })
+    return meResp
   },
 
   logout: () => {

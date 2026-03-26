@@ -19,10 +19,9 @@ export default function PlacesPage() {
   const load = async (p = page) => {
     setLoading(true)
     try {
-      const { data: resp } = await api.get('/places', { params: { page: p, page_size: 20 } })
-      const d = resp as { data?: Place[]; items?: Place[]; total?: number }
-      setPlaces(d.data ?? d.items ?? [])
-      setTotal(d.total ?? 0)
+      const { data: resp } = await api.get<{ data: Place[]; meta: { total: number } }>('/places', { params: { page: p, page_size: 20 } })
+      setPlaces(resp.data ?? [])
+      setTotal(resp.meta?.total ?? 0)
     } catch {
       toast('Place 목록 로드 실패', 'error')
     } finally {
