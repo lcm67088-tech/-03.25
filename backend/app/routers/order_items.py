@@ -516,8 +516,13 @@ async def list_order_items(
         )
     ).scalars().all()
 
+    def _item_with_transitions(i: OrderItem) -> dict:
+        d = OrderItemOut.from_orm(i).model_dump()
+        d["available_transitions"] = ALLOWED_TRANSITIONS.get(i.status, [])
+        return d
+
     return paginated(
-        [OrderItemOut.from_orm(i).model_dump() for i in rows],
+        [_item_with_transitions(i) for i in rows],
         total, page, page_size,
     )
 
@@ -529,7 +534,9 @@ async def get_order_item(
     _: User = Depends(get_current_user),
 ):
     item = await _get_item_or_404(item_id, db)
-    return ok(OrderItemOut.from_orm(item).model_dump())
+    data = OrderItemOut.from_orm(item).model_dump()
+    data["available_transitions"] = ALLOWED_TRANSITIONS.get(item.status, [])
+    return ok(data)
 
 
 @router.patch("/{item_id}", summary="OrderItem 필드 수정")
@@ -625,6 +632,9 @@ async def transition_status(
     response_data = OrderItemOut.from_orm(item).model_dump()
     if auto_close_result:
         response_data["order_auto_closed"] = auto_close_result
+
+    # 프론트엔드용: 현재 상태에서 가능한 다음 전이 목록
+    response_data["available_transitions"] = ALLOWED_TRANSITIONS.get(item.status, [])
 
     return ok(response_data)
 

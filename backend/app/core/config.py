@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     GOOGLE_SERVICE_ACCOUNT_JSON_PATH: str = "./credentials/google_service_account.json"
 
     # ── CORS ────────────────────────────────
-    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:8080"
+    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:3001,http://localhost:8080,http://localhost:5173,http://localhost:5174"
 
     @field_validator("SECRET_KEY")
     @classmethod

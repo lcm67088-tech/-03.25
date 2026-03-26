@@ -17,10 +17,14 @@ Wave 1 라우터 목록:
   /api/v1/audit-logs              — 감사 로그
   /api/v1/dashboard               — 운영 요약 (Wave 1 호환 + Wave 2-A 확장)
 """
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 from app.core.config import get_settings
 from app.routers.auth import router as auth_router
@@ -104,10 +108,40 @@ async def health_check():
     return {"status": "ok", "version": "0.1.0"}
 
 
-@app.get("/", tags=["health"])
+# ── 프론트엔드 정적 파일 서빙 ─────────────────────────────────
+# frontend/dist 디렉토리가 존재하면 정적 파일 서빙
+_FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+
+if _FRONTEND_DIST.exists():
+    # app.js 등 정적 에셋 서빙
+    app.mount("/static-assets", StaticFiles(directory=str(_FRONTEND_DIST)), name="frontend-static")
+
+    @app.get("/console/{full_path:path}", include_in_schema=False)
+    async def serve_console(full_path: str):
+        """프론트엔드 SPA — 모든 /console/* 경로를 index.html로 라우팅"""
+        index = _FRONTEND_DIST / "index.html"
+        if index.exists():
+            return FileResponse(str(index))
+        return {"error": "Frontend not built"}
+
+    @app.get("/console", include_in_schema=False)
+    async def serve_console_root():
+        index = _FRONTEND_DIST / "index.html"
+        if index.exists():
+            return FileResponse(str(index))
+        return {"error": "Frontend not built"}
+
+    # app.js 직접 접근
+    @app.get("/app.js", include_in_schema=False)
+    async def serve_app_js():
+        js_file = _FRONTEND_DIST / "app.js"
+        if js_file.exists():
+            return FileResponse(str(js_file), media_type="application/javascript")
+        return {"error": "app.js not found"}
+
+
+@app.get("/", include_in_schema=False)
 async def root():
-    return {
-        "app": "PlaceOpt Internal API",
-        "version": "0.1.0",
-        "docs": "/docs",
-    }
+    """루트: 콘솔 UI로 리다이렉트"""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/console")
