@@ -232,7 +232,7 @@ async def standardize_raw_input(
         source_type=raw.source_type,
         raw_input_id=raw.id,
         actor_id=actor_id,
-        conflict_policy="on_hold",  # 충돌 시 on_hold (에러 아님)
+        # conflict_policy 파라미터 제거 — on_hold 고정
     )
 
     # 첫 생성 시 sales_rep, estimator 보강

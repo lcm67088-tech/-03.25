@@ -39,11 +39,13 @@ class OrderGroupKeyConflictError(Exception):
     """
     같은 order_group_key에 속한 raw 행들이 서로 다른 agency 또는 brand를 가질 때 발생.
 
+    주로 로그/오류 추적용으로 사용되며, 실제 충돌 처리는 on_hold(고정)으로 수행됩니다.
+
     필드:
       key          — 충돌이 발생한 order_group_key 값
       existing     — 기존 Order의 (agency_id, agency_name_snapshot) 정보
       incoming     — 새로 들어온 행의 (agency_id, agency_name_snapshot) 정보
-      conflict_on  — 'agency' | 'brand' | 'agency+brand'
+      conflict_on  — 'agency' | 'brand'
     """
     def __init__(
         self,
@@ -264,25 +266,24 @@ async def resolve_order_group(
     source_type: str,
     raw_input_id: Optional[uuid.UUID],
     actor_id: Optional[uuid.UUID],
-    *,
-    conflict_policy: str = "on_hold",
 ) -> tuple[Order, Optional[str]]:
     """
     order_group_key 기반으로 Order를 조회하거나 신규 생성합니다.
 
-    Option A 규칙:
+    Option A 확정 규칙 (충돌 정책 = on_hold 고정):
       1. key = None/빈값  → 신규 Order 생성 (행마다 별도 Order)
       2. key 있음, 기존 draft Order 없음 → 신규 Order 생성 후 group_key 기록
       3. key 있음, 기존 draft Order 있음 → 기존 Order 재사용
-         a. agency/brand 불일치 확인
-            - conflict_policy='error'  → OrderGroupKeyConflictError 발생
-            - conflict_policy='on_hold'→ (order, conflict_reason) 반환
-              호출자가 OrderItem을 on_hold 상태로 생성해야 함.
+         agency/brand 불일치 → (order, conflict_reason) 반환
+         호출자가 해당 OrderItem을 on_hold 상태로 생성해야 함.
+
+    충돌 정책은 항상 on_hold입니다.
+    runtime 분기 없이 단일 경로로 처리합니다.
 
     반환값:
       (Order, conflict_reason)
-        - conflict_reason=None    : 충돌 없음, 정상 처리
-        - conflict_reason=str     : 충돌 발생 (policy='on_hold'일 때). 아이템을 on_hold로 생성할 것.
+        - conflict_reason=None : 충돌 없음, 정상 처리
+        - conflict_reason=str  : 충돌 발생. 아이템을 on_hold로 생성할 것.
 
     주의:
       - db.flush() 호출 후 order.id가 확보됩니다.
@@ -338,20 +339,8 @@ async def resolve_order_group(
     )
 
     if conflict_reason:
-        if conflict_policy == "error":
-            raise OrderGroupKeyConflictError(
-                key=key,
-                existing={
-                    "agency_id": str(existing_order.agency_id) if existing_order.agency_id else None,
-                    "agency_name_snapshot": existing_order.agency_name_snapshot,
-                },
-                incoming={
-                    "agency_id": str(agency_id) if agency_id else None,
-                    "agency_name_snapshot": agency_name_snapshot,
-                },
-                conflict_on="agency",
-            )
-        # on_hold 정책: 기존 Order 반환 + 충돌 사유 전달
+        # 충돌 정책 = on_hold 고정: 기존 Order 반환 + 충돌 사유 전달
+        # 호출자가 해당 OrderItem을 on_hold 상태로 생성해야 함.
         return existing_order, conflict_reason
 
     return existing_order, None
