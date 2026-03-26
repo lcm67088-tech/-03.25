@@ -42,14 +42,34 @@ class Settings(BaseSettings):
     # ── Google Sheets ────────────────────────
     GOOGLE_SERVICE_ACCOUNT_JSON_PATH: str = "./credentials/google_service_account.json"
 
-    # ── CORS ────────────────────────────────
-    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:3001,http://localhost:8080,http://localhost:5173,http://localhost:5174"
+    # ── CORS ─────────────────────────────────────────────────────────────────
+    # 환경별로 .env 파일의 CORS_ORIGINS를 쉼표 구분 문자열로 설정
+    #
+    # 로컬 개발 (.env):
+    #   CORS_ORIGINS=http://localhost:5173,http://localhost:3000
+    #
+    # 스테이징 (.env.staging 또는 서버 환경변수):
+    #   CORS_ORIGINS=https://staging-ops.papainite.co.kr,http://localhost:5173
+    #
+    # 운영 (.env.production):
+    #   CORS_ORIGINS=https://ops.papainite.co.kr
+    # ─────────────────────────────────────────────────────────────────────────
+    CORS_ORIGINS: str = (
+        "http://localhost:3000,"
+        "http://localhost:3001,"
+        "http://localhost:8080,"
+        "http://localhost:5173,"
+        "http://localhost:5174,"
+        # 스테이징 프론트엔드
+        "https://staging-ops.papainite.co.kr,"
+        # 운영 프론트엔드 (추후)
+        "https://ops.papainite.co.kr"
+    )
 
     @field_validator("SECRET_KEY")
     @classmethod
     def secret_key_must_be_set(cls, v: str) -> str:
-        if v.startswith("CHANGE_ME") and True:
-            # 개발 환경에서는 경고만 출력
+        if v.startswith("CHANGE_ME"):
             import warnings
             warnings.warn(
                 "SECRET_KEY is using default value. "
@@ -59,7 +79,7 @@ class Settings(BaseSettings):
         return v
 
     def get_cors_origins(self) -> List[str]:
-        return [o.strip() for o in self.CORS_ORIGINS.split(",")]
+        return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
 
 
 @lru_cache

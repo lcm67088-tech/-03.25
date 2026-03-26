@@ -23,10 +23,18 @@ frontend/node_modules/
 # pnpm store cache (로컬 전용)
 .pnpm-store/
 
-# 환경변수 (절대 커밋 금지)
+# 환경변수 정책:
+#   .env, .env.local — 실제 시크릿 포함, 절대 커밋 금지
+#   .env.staging, .env.production — 템플릿(플레이스홀더), 커밋 허용
+#   .env.example — 예시, 커밋 허용
 .env
-*.env
-!.env.example
+.env.local
+*.env.local
+# frontend .env 파일: .env.development 는 민감정보 없으므로 허용
+# backend .env 파일: 실제 secret 포함 가능하므로 .env.staging만 예외 허용
+backend/.env
+!backend/.env.staging
+!backend/.env.example
 
 # 가상환경
 venv/
