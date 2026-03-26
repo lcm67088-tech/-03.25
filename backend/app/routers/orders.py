@@ -169,6 +169,9 @@ class OrderOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     item_count: int = 0
+    # Phase 2-C: Order 종료 추적
+    closed_at: Optional[datetime] = None
+    closed_by: Optional[str] = None
 
     @classmethod
     def from_orm(cls, o: Order, item_count: int = 0) -> "OrderOut":
@@ -187,6 +190,9 @@ class OrderOut(BaseModel):
             created_at=o.created_at,
             updated_at=o.updated_at,
             item_count=item_count,
+            # Phase 2-C
+            closed_at=getattr(o, "closed_at", None),
+            closed_by=str(o.closed_by) if getattr(o, "closed_by", None) else None,
         )
 
 

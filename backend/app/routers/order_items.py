@@ -2,31 +2,28 @@
 OrderItem 라우터
 
 엔드포인트:
-  POST   /api/v1/order-items              — OrderItem 직접 생성 (web_portal 주 경로)
-  GET    /api/v1/order-items              — 목록 (필터: order_id, status, place_id, provider_id, raw_input_id)
-  GET    /api/v1/order-items/{id}         — 상세
-  PATCH  /api/v1/order-items/{id}         — 필드 수정
-  POST   /api/v1/order-items/{id}/status  — 상태 전이 (핵심)
-  POST   /api/v1/order-items/{id}/assign  — 실행처 배정 (수동 라우팅)
-  GET    /api/v1/order-items/{id}/history — 상태 이력
+  POST   /api/v1/order-items                     — OrderItem 직접 생성 (web_portal 주 경로)
+  GET    /api/v1/order-items                     — 목록 (필터: order_id, status, place_id, provider_id, raw_input_id)
+  GET    /api/v1/order-items/{id}                — 상세
+  PATCH  /api/v1/order-items/{id}                — 필드 수정 (closed/cancelled 제외)
+  POST   /api/v1/order-items/{id}/status         — 상태 전이 + 타임스탬프 자동 기록 (Phase 2-C)
+  PATCH  /api/v1/order-items/{id}/settlement     — settlement_note 수정 전용 (Phase 2-C)
+  POST   /api/v1/order-items/{id}/assign         — 실행처 배정 (수동 라우팅)
+  GET    /api/v1/order-items/{id}/history        — 상태 이력
+  GET    /api/v1/order-items/{id}/routing-candidates — 라우팅 후보 목록
 
-Wave 1 상태 전이 매트릭스:
-  received        → reviewing | on_hold | cancelled
-  reviewing       → ready_to_route | on_hold | cancelled
-  on_hold         → reviewing | cancelled
-  ready_to_route  → assigned | on_hold | cancelled
-  assigned        → in_progress | ready_to_route | cancelled
-  in_progress     → done | assigned | cancelled
-  done            → confirmed | in_progress
-  confirmed       → settlement_ready
-  settlement_ready→ closed
-  cancelled       → (종료)
-  closed          → (종료)
+Phase 2-C 상태 전이 타임스탬프 자동 기록 규칙:
+  done → confirmed          → confirmed_at = now() UTC
+  confirmed → settlement_ready → settlement_ready_at = now() UTC
+  settlement_ready → closed → closed_at = now() UTC
+                              → [Order auto-close 트리거]
 
-컬럼명 기준: 마이그레이션 002 (001 + raw 추적 컬럼 추가)
-  raw_input_id      — loose ref, FK 없음. web_portal 생성 시 NULL
-  source_row_index  — 원본 행 번호 (0-based)
-  item_index_in_row — 행 내 아이템 순번 (0-based)
+Order auto-close 조건 (모두 충족 시):
+  1. Order.status == 'confirmed'
+  2. 해당 Order의 모든 비삭제(is_deleted=False) OrderItem이 'closed' 또는 'cancelled'
+  → orders.closed_at = now(), orders.closed_by = current_user.id, orders.status = 'closed'
+
+컬럼명 기준: 마이그레이션 002 + 003 (Wave 2 Phase 2-C)
 """
 import uuid
 from datetime import date, datetime, timezone
@@ -59,6 +56,14 @@ ALLOWED_TRANSITIONS: dict[str, list[str]] = ORDER_ITEM_TRANSITIONS
 # Wave 2-A 결정: confirmed→settlement_ready 는 OPERATOR 허용, settlement_ready→closed 만 ADMIN 전용
 ADMIN_ONLY_TRANSITIONS: set[tuple[str, str]] = {
     ("settlement_ready", "closed"),
+}
+
+# Phase 2-C: 상태 전이 시 자동 기록할 타임스탬프 매핑
+# (from_status, to_status) → OrderItem 컬럼명
+TRANSITION_TIMESTAMP_MAP: dict[tuple[str, str], str] = {
+    ("done", "confirmed"): "confirmed_at",
+    ("confirmed", "settlement_ready"): "settlement_ready_at",
+    ("settlement_ready", "closed"): "closed_at",
 }
 
 
@@ -144,10 +149,20 @@ class AssignProviderRequest(BaseModel):
     reason: Optional[str] = None
 
 
+class SettlementNoteUpdate(BaseModel):
+    """
+    Phase 2-C: settlement_note 수정 전용 스키마.
+
+    정산 타임스탬프(confirmed_at, settlement_ready_at, closed_at)는
+    상태 전이 시 자동 기록만 허용 — 수동 override 불가.
+    """
+    settlement_note: str = Field(..., description="정산 메모 (빈 문자열로 초기화 가능)")
+
+
 class OrderItemOut(BaseModel):
     """
     OrderItem 응답 스키마.
-    raw 추적 컬럼 포함 (마이그레이션 002 기준).
+    Phase 2-C: 정산 타임스탬프 + settlement_note 포함.
     """
     id: str
     order_id: str
@@ -194,6 +209,12 @@ class OrderItemOut(BaseModel):
     is_deleted: bool
     created_at: datetime
     updated_at: datetime
+
+    # Phase 2-C: 정산 타임스탬프 + 메모
+    confirmed_at: Optional[datetime]
+    settlement_ready_at: Optional[datetime]
+    closed_at: Optional[datetime]
+    settlement_note: Optional[str]
 
     @classmethod
     def from_orm(cls, item: OrderItem) -> "OrderItemOut":
@@ -242,6 +263,11 @@ class OrderItemOut(BaseModel):
             is_deleted=item.is_deleted,
             created_at=item.created_at,
             updated_at=item.updated_at,
+            # Phase 2-C 정산 필드
+            confirmed_at=item.confirmed_at,
+            settlement_ready_at=item.settlement_ready_at,
+            closed_at=item.closed_at,
+            settlement_note=item.settlement_note,
         )
 
 
@@ -292,6 +318,81 @@ async def _add_status_history(
         reason=reason,
     )
     db.add(history)
+
+
+async def _try_auto_close_order(
+    db: AsyncSession,
+    order_id: uuid.UUID,
+    closed_by: uuid.UUID,
+) -> Optional[dict]:
+    """
+    Phase 2-C Order auto-close 트리거.
+
+    조건:
+      1. Order.status == 'confirmed'
+      2. 해당 Order의 모든 비삭제 OrderItem이 'closed' 또는 'cancelled'
+
+    조건 충족 시:
+      - orders.status = 'closed'
+      - orders.closed_at = now() UTC
+      - orders.closed_by = closed_by
+
+    Returns:
+      {"auto_closed": True, "order_id": str, "closed_at": ISO str} 또는 None
+    """
+    order = (
+        await db.execute(
+            select(Order).where(
+                Order.id == order_id,
+                Order.is_deleted.is_(False),
+            )
+        )
+    ).scalar_one_or_none()
+
+    if not order or order.status != "confirmed":
+        # 조건 1 미충족: Order가 confirmed 상태가 아님
+        return None
+
+    # 조건 2: 비삭제 OrderItem 전체가 closed 또는 cancelled인지 확인
+    # 비삭제 아이템 중 closed/cancelled 가 아닌 것의 수
+    non_terminal_count = (
+        await db.execute(
+            select(func.count()).where(
+                OrderItem.order_id == order_id,
+                OrderItem.is_deleted.is_(False),
+                OrderItem.status.not_in(["closed", "cancelled"]),
+            )
+        )
+    ).scalar_one()
+
+    if non_terminal_count > 0:
+        # 아직 진행 중인 아이템이 있음 → auto-close 미실행
+        return None
+
+    # 비삭제 아이템이 최소 1개 이상인지 확인 (엣지케이스: 아이템이 없는 경우 방지)
+    total_active = (
+        await db.execute(
+            select(func.count()).where(
+                OrderItem.order_id == order_id,
+                OrderItem.is_deleted.is_(False),
+            )
+        )
+    ).scalar_one()
+
+    if total_active == 0:
+        return None
+
+    # auto-close 실행
+    now_utc = datetime.now(timezone.utc)
+    order.status = "closed"
+    order.closed_at = now_utc
+    order.closed_by = closed_by
+
+    return {
+        "auto_closed": True,
+        "order_id": str(order.id),
+        "closed_at": now_utc.isoformat(),
+    }
 
 
 # ── 엔드포인트 ──────────────────────────────────────────────────
@@ -451,7 +552,7 @@ async def update_order_item(
     return ok(OrderItemOut.from_orm(item).model_dump())
 
 
-@router.post("/{item_id}/status", summary="상태 전이")
+@router.post("/{item_id}/status", summary="상태 전이 (Phase 2-C 타임스탬프 자동 기록)")
 async def transition_status(
     item_id: uuid.UUID,
     body: StatusTransitionRequest,
@@ -459,13 +560,25 @@ async def transition_status(
     current_user: User = Depends(require_operator),
 ):
     """
-    Wave 1 상태 전이.
-    ADMIN_ONLY_TRANSITIONS에 해당하는 전이는 ADMIN만 가능.
+    Phase 2-C 상태 전이.
+
+    ADMIN_ONLY_TRANSITIONS에 해당하는 전이(settlement_ready→closed)는 ADMIN만 가능.
+
+    정산 타임스탬프 자동 기록 (수동 override 불가):
+      done → confirmed          → confirmed_at = now() UTC
+      confirmed → settlement_ready → settlement_ready_at = now() UTC
+      settlement_ready → closed → closed_at = now() UTC
+                                  → Order auto-close 트리거
+
+    Order auto-close:
+      Order.status == 'confirmed' AND 모든 비삭제 OrderItem이 closed/cancelled
+      → orders.status='closed', orders.closed_at=now(), orders.closed_by=current_user.id
     """
     item = await _get_item_or_404(item_id, db)
     from_status = item.status
     to_status = body.to_status
 
+    # 전이 허용 여부 확인
     allowed = ALLOWED_TRANSITIONS.get(from_status, [])
     if to_status not in allowed:
         raise HTTPException(
@@ -473,6 +586,7 @@ async def transition_status(
             f"허용되지 않는 상태 전이: {from_status} → {to_status}. 허용: {allowed}",
         )
 
+    # ADMIN 전용 전이 권한 확인
     if (from_status, to_status) in ADMIN_ONLY_TRANSITIONS:
         if not current_user.is_admin:
             raise HTTPException(
@@ -480,12 +594,71 @@ async def transition_status(
                 f"이 전이({from_status} → {to_status})는 ADMIN만 가능합니다.",
             )
 
+    # 상태 업데이트
     item.status = to_status
+
+    # Phase 2-C: 정산 타임스탬프 자동 기록
+    # settlement_ready_at / confirmed_at / closed_at 는 수동 override 없이 전이 시에만 기록
+    ts_column = TRANSITION_TIMESTAMP_MAP.get((from_status, to_status))
+    now_utc = datetime.now(timezone.utc)
+    if ts_column:
+        setattr(item, ts_column, now_utc)
+
+    # 상태 이력 기록
     await _add_status_history(
         db, item.id, from_status, to_status,
         changed_by=current_user.id,
         reason=body.reason,
     )
+
+    # Phase 2-C: settlement_ready → closed 전이 후 Order auto-close 시도
+    auto_close_result = None
+    if from_status == "settlement_ready" and to_status == "closed":
+        await db.flush()  # item 상태를 DB에 반영한 후 집계
+        auto_close_result = await _try_auto_close_order(
+            db, item.order_id, current_user.id
+        )
+
+    await db.commit()
+    await db.refresh(item)
+
+    response_data = OrderItemOut.from_orm(item).model_dump()
+    if auto_close_result:
+        response_data["order_auto_closed"] = auto_close_result
+
+    return ok(response_data)
+
+
+@router.patch(
+    "/{item_id}/settlement",
+    summary="정산 메모 수정 (Phase 2-C, settlement_note 전용)",
+)
+async def update_settlement_note(
+    item_id: uuid.UUID,
+    body: SettlementNoteUpdate,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_operator),
+):
+    """
+    Phase 2-C: settlement_note 수정 전용 엔드포인트.
+
+    허용 상태: settlement_ready 또는 closed
+    (정산 흐름에 진입한 아이템에 한해 메모 추가/수정 가능)
+
+    정산 타임스탬프(confirmed_at, settlement_ready_at, closed_at)는
+    이 엔드포인트로 변경 불가 — 상태 전이 시 자동 기록만 허용.
+    """
+    item = await _get_item_or_404(item_id, db)
+
+    if item.status not in ("settlement_ready", "closed"):
+        raise HTTPException(
+            400,
+            f"settlement_note는 settlement_ready 또는 closed 상태에서만 수정 가능합니다. "
+            f"현재 상태: {item.status}",
+        )
+
+    item.settlement_note = body.settlement_note
+
     await db.commit()
     await db.refresh(item)
     return ok(OrderItemOut.from_orm(item).model_dump())
@@ -573,7 +746,7 @@ async def get_routing_candidates(
       1. OrderItem.sellable_offering_id 또는 product_type_code 기반 SellableOffering 조회
       2. SellableProviderMapping 테이블에서 매칭된 후보 조회
       3. 후보 정렬 순서:
-           a. SellableProviderMapping.priority ASC (낙을수우선)
+           a. SellableProviderMapping.priority ASC (낮을수록 우선)
            b. provider_offering.cost_price ASC (cost_price <= item.unit_price면 is_price_ok=True)
            c. Provider.created_at ASC
       4. is_active=True 매핑과 Provider만 포함

@@ -6,13 +6,14 @@
   GET /api/v1/dashboard/summary            — 확장 운영 요약 (Wave 2-A)
   GET /api/v1/dashboard/items-by-status    — OrderItem 상태별 집계 (Wave 2-A)
   GET /api/v1/dashboard/orders-by-agency   — 대행사별 주문 집계 (Wave 2-A)
-  GET /api/v1/dashboard/settlement         — 정산 현황 (Wave 2-A, ADMIN)
+  GET /api/v1/dashboard/settlement         — 정산 현황 (Phase 2-C, ADMIN, UTC 기간 필터)
 """
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select
+from sqlalchemy import func, select, case, literal, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -305,39 +306,172 @@ async def get_orders_by_agency(
     })
 
 
-@router.get("/settlement", summary="정산 현황 (ADMIN 전용, Wave 2-A)")
+@router.get("/settlement", summary="정산 현황 (ADMIN 전용, Phase 2-C)")
 async def get_settlement_dashboard(
+    closed_from: Optional[str] = Query(
+        None,
+        description="정산 종료 기간 시작 (UTC, ISO 8601: YYYY-MM-DDTHH:MM:SSZ 또는 YYYY-MM-DD)",
+        alias="closed_from",
+    ),
+    closed_to: Optional[str] = Query(
+        None,
+        description="정산 종료 기간 끝 (UTC, ISO 8601: YYYY-MM-DDTHH:MM:SSZ 또는 YYYY-MM-DD, 포함)",
+        alias="closed_to",
+    ),
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_admin),
 ):
     """
-    Wave 2-A 정산 현황 (ADMIN 전용).
+    Phase 2-C 정산 현황 (ADMIN 전용).
 
     정산 흐름:
-      done → confirmed (OPERATOR)
-      confirmed → settlement_ready (OPERATOR)
-      settlement_ready → closed (ADMIN 최종 승인)
+      done → confirmed (OPERATOR) → confirmed_at 기록
+      confirmed → settlement_ready (OPERATOR) → settlement_ready_at 기록
+      settlement_ready → closed (ADMIN 최종 승인) → closed_at 기록
+
+    기간 필터 (closed_from / closed_to):
+      - OrderItem.closed_at 기준으로 필터링 (UTC)
+      - 날짜만 전달 시 (YYYY-MM-DD) 해당 일 00:00:00Z ~ 23:59:59.999999Z 범위로 처리
+      - 기간 미지정 시 전체 집계
+
+    Agency 집계:
+      - OrderItem → Order JOIN 후 agency_name_snapshot 기준 집계
+      - agency_id가 NULL이거나 agency_name_snapshot이 NULL인 경우
+        → "(미지정)" 키로 fallback 집계 (누락 없음)
     """
+    # ── 기간 필터 파싱 (UTC 강제) ─────────────────────────────
+    def _parse_utc(value: Optional[str], end_of_day: bool = False) -> Optional[datetime]:
+        """
+        ISO 8601 문자열을 UTC datetime으로 파싱.
+        날짜만 오는 경우(YYYY-MM-DD): end_of_day=False면 00:00:00Z, True면 23:59:59.999999Z
+        """
+        if not value:
+            return None
+        value = value.strip()
+        # 날짜만인 경우
+        if len(value) == 10 and "T" not in value:
+            from datetime import timedelta
+            from datetime import date as _date
+            d = datetime.strptime(value, "%Y-%m-%d")
+            if end_of_day:
+                return d.replace(hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc)
+            return d.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+        # ISO 8601 datetime
+        try:
+            # Z suffix → UTC
+            if value.endswith("Z"):
+                value = value[:-1] + "+00:00"
+            dt = datetime.fromisoformat(value)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt
+        except ValueError:
+            return None
+
+    dt_from = _parse_utc(closed_from, end_of_day=False)
+    dt_to = _parse_utc(closed_to, end_of_day=True)
+
+    # ── 기본 필터 조건 구성 ──────────────────────────────────
     SETTLEMENT_STATUSES = ["done", "confirmed", "settlement_ready", "closed"]
 
-    rows = (
-        await db.execute(
-            select(
-                OrderItem.status,
-                func.count().label("cnt"),
-                func.coalesce(func.sum(OrderItem.total_amount), 0).label("total_amount"),
-            )
-            .where(
-                OrderItem.is_deleted.is_(False),
-                OrderItem.status.in_(SETTLEMENT_STATUSES),
-            )
-            .group_by(OrderItem.status)
-        )
-    ).all()
+    base_where = [
+        OrderItem.is_deleted.is_(False),
+        OrderItem.status.in_(SETTLEMENT_STATUSES),
+    ]
 
-    stats = {row[0]: {"count": row[1], "total_amount": int(row[2])} for row in rows}
+    # closed_at 기간 필터: closed 상태 아이템에 대해서만 closed_at 범위 적용
+    # 단, done/confirmed/settlement_ready 는 기간 필터와 무관하게 항상 포함
+    # (기간 필터는 closed 상태만 필터링 — settlement pipeline 전체 현황 파악 목적)
+    closed_at_conditions = []
+    if dt_from:
+        closed_at_conditions.append(OrderItem.closed_at >= dt_from)
+    if dt_to:
+        closed_at_conditions.append(OrderItem.closed_at <= dt_to)
+
+    # ── 1. 전체 파이프라인 집계 ──────────────────────────────
+    pipeline_q = (
+        select(
+            OrderItem.status,
+            func.count().label("cnt"),
+            func.coalesce(func.sum(OrderItem.total_amount), 0).label("total_amount"),
+        )
+        .where(*base_where)
+    )
+
+    # closed 상태에만 기간 필터 적용 (OR로 non-closed 포함)
+    if closed_at_conditions:
+        from sqlalchemy import or_, and_
+        pipeline_q = pipeline_q.where(
+            or_(
+                OrderItem.status != "closed",
+                and_(*closed_at_conditions),
+            )
+        )
+
+    pipeline_q = pipeline_q.group_by(OrderItem.status)
+    pipeline_rows = (await db.execute(pipeline_q)).all()
+    stats = {row[0]: {"count": row[1], "total_amount": int(row[2])} for row in pipeline_rows}
+
+    # ── 2. Agency별 closed 아이템 집계 ──────────────────────
+    # OrderItem → Order JOIN
+    # agency_name_snapshot NULL인 경우 "(미지정)"으로 fallback
+    # PostgreSQL GROUP BY: 원본 컬럼(Order.agency_name_snapshot, Order.agency_id)으로
+    # GROUP BY하고 SELECT에서 COALESCE 적용
+    agency_q = (
+        select(
+            Order.agency_name_snapshot,
+            Order.agency_id,
+            func.count(OrderItem.id).label("cnt"),
+            func.coalesce(func.sum(OrderItem.total_amount), 0).label("total_amount"),
+        )
+        .join(Order, OrderItem.order_id == Order.id)
+        .where(
+            OrderItem.is_deleted.is_(False),
+            OrderItem.status == "closed",
+            Order.is_deleted.is_(False),
+        )
+    )
+
+    if closed_at_conditions:
+        for cond in closed_at_conditions:
+            agency_q = agency_q.where(cond)
+
+    agency_q = (
+        agency_q
+        .group_by(Order.agency_name_snapshot, Order.agency_id)
+        .order_by(func.sum(OrderItem.total_amount).desc().nullslast())
+    )
+
+    agency_rows = (await db.execute(agency_q)).all()
+
+    agency_breakdown = [
+        {
+            # agency_name_snapshot NULL → "(미지정)" fallback
+            "agency_name": row[0] if row[0] else "(미지정)",
+            "agency_id": str(row[1]) if row[1] else None,
+            "closed_count": row[2],
+            "total_amount": int(row[3]),
+        }
+        for row in agency_rows
+    ]
+
+    # ── 3. settlement_ready_at 기준 대기 집계 ────────────────
+    # pending_admin_approval: settlement_ready 아이템 (기간 필터 미적용 — 전체 대기 현황)
+    pending_count = stats.get("settlement_ready", {}).get("count", 0)
+    pending_amount = stats.get("settlement_ready", {}).get("total_amount", 0)
+
+    # ── 응답 구성 ─────────────────────────────────────────────
+    filter_info: dict = {
+        "closed_from": dt_from.isoformat() if dt_from else None,
+        "closed_to": dt_to.isoformat() if dt_to else None,
+        "timezone": "UTC",
+        "note": "closed_from/to 필터는 OrderItem.closed_at(UTC) 기준. closed 상태에만 적용.",
+    }
 
     return ok({
+        "filter": filter_info,
         "pipeline": {
             st: {
                 "count": stats.get(st, {}).get("count", 0),
@@ -346,12 +480,13 @@ async def get_settlement_dashboard(
             for st in SETTLEMENT_STATUSES
         },
         "pending_admin_approval": {
-            "count": stats.get("settlement_ready", {}).get("count", 0),
-            "total_amount": stats.get("settlement_ready", {}).get("total_amount", 0),
+            "count": pending_count,
+            "total_amount": pending_amount,
             "description": "settlement_ready → closed 전이는 ADMIN 최종 승인 필요",
         },
         "total_closed": {
             "count": stats.get("closed", {}).get("count", 0),
             "total_amount": stats.get("closed", {}).get("total_amount", 0),
         },
+        "closed_by_agency": agency_breakdown,
     })
