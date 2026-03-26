@@ -77,6 +77,10 @@ class OrderCreate(BaseModel):
         default="web_portal",
         description="web_portal | google_sheet_import | excel_import | manual_input",
     )
+    order_group_key: Optional[str] = Field(
+        default=None,
+        description="같은 key면 동일 Order로 묶음. NULL/빈값이면 별도 Order 생성. (Option A)",
+    )
     operator_note: Optional[str] = None
 
 
@@ -159,6 +163,7 @@ class OrderOut(BaseModel):
     estimator_name: Optional[str]
     source_type: Optional[str]
     status: str
+    order_group_key: Optional[str]  # Option A (migration 004)
     operator_note: Optional[str]
     is_deleted: bool
     created_at: datetime
@@ -176,6 +181,7 @@ class OrderOut(BaseModel):
             estimator_name=o.estimator_name,
             source_type=o.source_type,
             status=o.status,
+            order_group_key=getattr(o, "order_group_key", None),
             operator_note=o.operator_note,
             is_deleted=o.is_deleted,
             created_at=o.created_at,
@@ -269,7 +275,7 @@ async def create_order_from_raw(
 
     result = await standardize_raw_input(db=db, raw=raw, actor=current_user)
 
-    return ok({
+    resp: dict[str, Any] = {
         "order": OrderOut.from_orm(
             result.order,
             item_count=len(result.items) + len(result.held_items),
@@ -277,7 +283,15 @@ async def create_order_from_raw(
         "items_created": len(result.items),
         "items_on_hold": len(result.held_items),
         "item_ids": [str(i.id) for i in result.items + result.held_items],
-    })
+    }
+    # order_group_key 충돌이 있으면 응답에 포함 (운영자에게 명시적으로 알림)
+    if result.group_key_conflict:
+        resp["group_key_conflict"] = result.group_key_conflict
+        resp["group_key_conflict_note"] = (
+            "order_group_key 충돌로 인해 모든 아이템이 on_hold 상태로 생성되었습니다. "
+            "운영자가 아이템을 직접 확인하고 처리해야 합니다."
+        )
+    return ok(resp)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED, summary="직접 주문 생성 (web_portal 주 경로)")
@@ -301,6 +315,7 @@ async def create_order(
         sales_rep_name=body.sales_rep_name,
         estimator_name=body.estimator_name,
         source_type=body.source_type,
+        order_group_key=body.order_group_key or None,
         operator_note=body.operator_note,
     )
     db.add(order)

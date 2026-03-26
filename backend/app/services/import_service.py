@@ -169,12 +169,25 @@ async def _save_raw_input(
     job.job_type에 따라 분기.
     """
     if job.job_type == "order_import":
+        # order_group_key 파싱 (Option A)
+        # 주요 콼럼명 별칭 순서대로 확인
+        raw_group_key_value = (
+            row_data.get("order_group_key")
+            or row_data.get("주문그룹키")
+            or row_data.get("그룹키")
+        )
+        group_key: str | None = None
+        if raw_group_key_value is not None:
+            s = str(raw_group_key_value).strip()
+            group_key = s if s else None
+
         raw = OrderRawInput(
             source_type=job.source_type,
             source_ref=f"{job.source_ref}#row{row_number}",
             source_row_index=row_number,   # 마이그레이션 기준: source_row_index
             import_job_id=job.id,
             raw_data=row_data,
+            order_group_key=group_key,     # Option A: 시트에서 파싱한 group key
         )
         db.add(raw)
         await db.flush()

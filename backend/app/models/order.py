@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from sqlalchemy import (
     Boolean, Date, DateTime, ForeignKey,
-    Integer, String, Text,
+    Integer, String, Text, Index,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -82,6 +82,12 @@ class OrderRawInput(ImmutableBase):
         UUID(as_uuid=True), nullable=True,
         comment="ImportJob UUID (loose reference, FK 없음)",
     )
+    # ── Step 1: order_group_key (migration 004) ───────────────
+    # 시트/파일 행에서 파싱한 원본 group key. immutable 보존.
+    order_group_key: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, index=True,
+        comment="시트/파일 행에서 파싱한 원본 order_group_key. immutable 보존.",
+    )
     raw_data: Mapped[dict] = mapped_column(JSONB, nullable=False)
     is_processed: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
@@ -137,6 +143,23 @@ class Order(BaseModel):
     )
     # 마이그레이션 기준: operator_note (구 note)
     operator_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # ── Step 1: order_group_key (migration 004) ───────────────
+    # Option A 확정: 같은 key면 동일 Order 재사용 / NULL이면 별도 Order
+    order_group_key: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, index=True,
+        comment="같은 key면 동일 Order로 묶음. NULL/빈값이면 행마다 별도 Order 생성.",
+    )
+
+    # ── Phase 2-C: Order 종료 추적 (migration 003) ───────────
+    closed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="Order 전체 종료 시각 (모든 OrderItem closed 후 기록)",
+    )
+    closed_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True,
+        comment="Order 종료 처리자 UUID (loose reference, FK 없음)",
+    )
 
     agency: Mapped[Optional["Agency"]] = relationship("Agency", foreign_keys=[agency_id])
     items: Mapped[list["OrderItem"]] = relationship(
@@ -240,6 +263,26 @@ class OrderItem(BaseModel):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
     )
     operator_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # ── Phase 2-C: 정산 추적 타임스탬프 (migration 003) ──────
+    # 상태 전이 시 자동 기록 — 빠른 집계용 비정규화 컬럼
+    # (정확한 이력은 order_item_status_histories 참조)
+    confirmed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="done→confirmed 전이 시각",
+    )
+    settlement_ready_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="confirmed→settlement_ready 전이 시각",
+    )
+    closed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="settlement_ready→closed 전이 시각 (ADMIN 최종 승인)",
+    )
+    settlement_note: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="정산 관련 운영자 메모",
+    )
 
     order: Mapped["Order"] = relationship("Order", back_populates="items")
     place: Mapped[Optional["Place"]] = relationship("Place", foreign_keys=[place_id])
